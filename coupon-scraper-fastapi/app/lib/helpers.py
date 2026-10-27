@@ -309,3 +309,46 @@ async def fetch_page(client, url, params=None, headers=None):
     except Exception as e:
         logger.error(f"Error fetching page {url}: {e}")
         return None
+
+
+# Seconds to wait for one ZenRows request; JS rendering can take a while, but a site should never hang a run
+TIMEOUT = 90
+
+# Try the cheap/fast settings first; if the site blocks us (422), move to the next one
+ATTEMPTS = [
+    {},
+    {},
+    {"js_render": "true", "premium_proxy": "true"},
+]
+
+
+def get_response(url):
+    """Return (html, status). Retries only when blocked (422); any other status returns immediately.
+    Network errors are raised so the caller can treat the site as "could not fetch"."""
+    for params in ATTEMPTS:
+        response = client.get(url, params=params, timeout=TIMEOUT)
+        if response.status_code != 422:
+            return response.text, response.status_code
+        # ZenRows puts the error reason in the JSON "title"; never log the request URL since it contains the API key
+        try:
+            reason = response.json().get("title")
+        except ValueError:
+            reason = response.text[:200]
+        logger.warning(f"Retry ({response.status_code}) {url}: {reason}")
+    return response.text, response.status_code
+
+
+def get_rendered(url):
+    """Fetch with JS rendering, for pages that only show their content after scripts run."""
+    response = client.get(
+        url,
+        params={"js_render": "true", "premium_proxy": "true", "wait": "5000"},
+        timeout=TIMEOUT,
+    )
+    return response.text, response.status_code
+
+
+def fetch_once(url):
+    """One plain request, no retries: for sites where an unknown store always comes back as 422."""
+    response = client.get(url, timeout=TIMEOUT)
+    return response.text, response.status_code
