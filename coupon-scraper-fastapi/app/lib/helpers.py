@@ -12,7 +12,7 @@ from zenrows import ZenRowsClient
 from app.config import settings
 from app.lib.logger import get_logger
 
-client = ZenRowsClient("fa0f561cee2fa9ba7976f152b852a663fdcd8791")
+client = ZenRowsClient(settings.ZENROWS_API_KEY)
 
 ua = UserAgent()
 
@@ -235,7 +235,6 @@ def postZenrowsResponse(url, data=None, headers=None, isProxy=False):
 
 # Helper function to create a ZenRows client
 def zenrowsClient():
-    logger.info(f"settings.ZENROWS_API_KEY: {settings.ZENROWS_API_KEY}")
     api_key = settings.ZENROWS_API_KEY
     client = ZenRowsClient(apikey=api_key, concurrency=5, timeout=60, retries=1)
     return client
