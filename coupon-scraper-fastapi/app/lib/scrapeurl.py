@@ -1,11 +1,13 @@
 import json
+import re
 from urllib.parse import urlparse
 
 import requests
 from bs4 import BeautifulSoup
 
 from app.config.headers import headers
-from app.lib.helpers import getZenrowsTwoResponse, postZenrowsResponse
+from app.lib.helpers import (fetch_once, get_rendered, get_response,
+                             getZenrowsTwoResponse, postZenrowsResponse)
 from app.lib.logger import get_logger
 
 # set log level
@@ -20,6 +22,107 @@ def isExists(extDomain, storeDomain, handles):
         ):
             return True
     return False
+
+
+def slugs(query):
+    """Build both 'cozy-earth' and 'cozyearth' style slugs from names like 'Cozy Earth'."""
+    all_names = [query["handle"]] + query["query"]
+    result = []
+    for name in all_names:
+        name = name.strip().lower()
+        result += [name.replace(" ", "-"), name.replace(" ", "").replace("-", "")]
+    return list(dict.fromkeys(result))
+
+
+def normalize(text):
+    return text.lower().replace(" ", "").replace("-", "").replace("'", "").replace("’", "")
+
+
+def title_mentions_store(html, query):
+    # Check only the <title>: some sites echo the requested slug in links and data even for unknown stores
+    title = re.search(r"<title>(.*?)</title>", html, re.S)
+    if not title:
+        return False
+    text = title.group(1).lower().replace(" ", "").replace("-", "").replace("'", "")
+    return any(name.replace("-", "") in text for name in slugs(query))
+
+
+def check_url(site_name, url, is_valid, recheck=False, fetch=get_response):
+    """True if the page has codes, False if it doesn't (or is gone), None if it couldn't be fetched."""
+    label = "Re-checking" if recheck else "Checking"
+    try:
+        logger.info(f"{label} {site_name}: {url}")
+        response, status = fetch(url)
+        # Some WordPress sites (savingheist, coupongrouphy) sometimes serve a JS challenge page first
+        if status == 200 and "<title>One moment, please...</title>" in response:
+            logger.warning(f"Challenge page, retrying with JS rendering: {url}")
+            response, status = get_rendered(url)
+        # Some sites (e.g. valuecom) occasionally return a cut-off page with only <head>; ask once more
+        if status == 200 and "<body" not in response.lower():
+            logger.warning(f"Incomplete page, retrying: {url}")
+            response, status = fetch(url)
+            if status == 200 and "<body" not in response.lower():
+                logger.warning(f"Incomplete page again, skipping: {url}")
+                return None
+    except Exception as e:
+        logger.error(f"Error fetching {site_name} ({url}): {e}")
+        return None
+
+    # 422 = blocked, 429 = too many requests, 5xx = server trouble: none of these say the page is gone
+    if status == 422 or status == 429 or status >= 500:
+        logger.warning(f"Could not fetch: {url} (Status: {status})")
+        return None
+    if status != 200:
+        logger.info(f"Not found: {url} (Status: {status})")
+        return False
+    if not is_valid(response):
+        logger.info(f"{site_name}: page exists but has no codes for this store: {url}")
+        return False
+    logger.info(f"Valid store page with codes: {url}")
+    return True
+
+
+def check_site(handles, storeDomain, query, site_name, extDomain, make_url, is_valid, fetch=get_response):
+    """Re-check saved URLs, otherwise try each slug and keep the first URL whose page passes is_valid."""
+    extHandles = handles.copy()
+    extHandles.setdefault(storeDomain, {}).setdefault(extDomain, [])
+
+    # Saved URLs are re-checked so a page that dropped its codes doesn't stay "found".
+    # A blocked or failed request (422, network error) keeps the URL, since that says nothing about the page.
+    saved = extHandles[storeDomain][extDomain]
+    dropped = set()
+    if saved:
+        kept = []
+        for url in saved:
+            result = check_url(site_name, url, is_valid, recheck=True, fetch=fetch)
+            if result is False:
+                dropped.add(url)
+            else:
+                kept.append(url)
+        extHandles[storeDomain][extDomain] = kept
+        if kept:
+            return extHandles
+        logger.info(f"{site_name}: saved link no longer has codes, searching again")
+
+    # make_url may return one URL or a list of URLs to try for each slug
+    candidates = [make_url(name) for name in slugs(query)]
+    urls = list(dict.fromkeys(u for c in candidates for u in ([c] if isinstance(c, str) else c)))
+    for url in urls:
+        if url in dropped:
+            continue
+        if check_url(site_name, url, is_valid, fetch=fetch):
+            extHandles[storeDomain][extDomain].append(url)
+            break
+
+    return extHandles
+
+
+def unsupported(handles, storeDomain, extDomain, reason):
+    """Return an empty list for sites we can't get codes from, without spending requests."""
+    extHandles = handles.copy()
+    extHandles.setdefault(storeDomain, {}).setdefault(extDomain, [])
+    logger.info(f"Skipping {extDomain}: {reason}")
+    return extHandles
 
 
 def coupert(handles, storeDomain, query):
