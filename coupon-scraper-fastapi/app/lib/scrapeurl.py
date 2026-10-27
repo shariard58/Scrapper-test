@@ -1,11 +1,9 @@
 import json
 import re
-from urllib.parse import urlparse
+from html import unescape
 
-import requests
 from bs4 import BeautifulSoup
 
-from app.config.headers import headers
 from app.lib.helpers import (fetch_once, get_rendered, get_response,
                              getZenrowsTwoResponse, postZenrowsResponse)
 from app.lib.logger import get_logger
@@ -126,421 +124,105 @@ def unsupported(handles, storeDomain, extDomain, reason):
 
 
 def coupert(handles, storeDomain, query):
-    extDomain = "coupert"
-    extHandles = handles.copy()
-    hasAlready = isExists(extDomain, storeDomain, handles)
+    # www.coupert.com/shop/{domain} loads without blocking. Unknown stores show the homepage.
+    # The store's own codes are in the Next.js data at props.pageProps.storeInfo.coupons;
+    # codes elsewhere on the page belong to other featured stores.
+    # Old /store/{domain} links already saved in the DB still work with fetch_coupons_from_coupert.
+    def has_codes(html):
+        match = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.S)
+        if not match:
+            return False
+        store = json.loads(match.group(1)).get("props", {}).get("pageProps", {}).get("storeInfo") or {}
+        return any(coupon.get("code") for coupon in store.get("coupons") or [])
 
-    if storeDomain not in extHandles:
-        extHandles[storeDomain] = {}
-
-    if not hasAlready:
-        extHandles[storeDomain][extDomain] = []
-
-        url = (
-            f"https://www.coupert.com/api/v3/store/search_stores?keyword={storeDomain}"
-        )
-        try:
-            response = requests.get(url, headers=headers)
-            if not response or response.status_code != 200:
-                logger.warning(
-                    f"Invalid response from {url}: status {response.status_code if response else 'None'}"
-                )
-            else:
-                # Check if response has content before parsing JSON
-                if not response.text or not response.text.strip():
-                    logger.warning(f"Empty response from {url}")
-                else:
-                    try:
-                        jsondata = response.json()
-                        if "data" in jsondata:
-                            for item in jsondata["data"]:
-                                if "Domain" in item:
-                                    if item["Domain"] == storeDomain:
-                                        handle = f'https://www.coupert.com/store/{item["Domain"]}'
-                                        extHandles[storeDomain][extDomain].append(
-                                            handle
-                                        )
-                    except ValueError as json_error:
-                        logger.error(f"Invalid JSON response from {url}: {json_error}")
-                        logger.debug(f"Response text: {response.text[:200]}")
-
-        except Exception as e:
-            logger.error(f"Error  fetching {url}: {e}")
-
-        urls = [
-            f"https://savings.coupert.com/api/browser/search?wd={storeDomain}",
-            f"https://top.coupert.com/api/browser/search?wd={storeDomain}",
-            f"https://ca.coupert.com/api/browser/search?wd={storeDomain}",
-            f"https://fashion.coupert.com/api/browser/search?wd={storeDomain}",
-        ]
-
-        for i, url in enumerate(urls):
-            try:
-                # response = requests.get(url, headers=headers)
-                # jsondata = response.json()
-                response, status = postZenrowsResponse(url)
-                if not response:
-                    continue
-                jsondata = json.loads(response)
-
-                logger.info(f"Fetching {url}...")
-                logger.info(jsondata)
-
-                if "data" in jsondata:
-                    for item in jsondata["data"]:
-                        if "urlname" in item:
-                            pathname = item["urlname"]
-                            if pathname.startswith("/"):
-                                pathname = pathname[1:]
-
-                            parsed_url = urlparse(url)
-                            host = (
-                                parsed_url.netloc
-                                if parsed_url.netloc
-                                else parsed_url.path
-                            )
-
-                            handle = "https://" + host + "/" + pathname
-                            extHandles[storeDomain][extDomain].append(handle)
-
-            except Exception as e:
-                logger.error(f"Error fetching {url}: {e}")
-                continue
-
-    return extHandles
+    return check_site(
+        handles, storeDomain, query, "Coupert", "coupert",
+        lambda name: f"https://www.coupert.com/shop/{storeDomain}",
+        has_codes,
+    )
 
 
 def discounttime(handles, storeDomain, query):
-    extDomain = "discountime"
-    extHandles = handles.copy()
-    hasAlready = isExists(extDomain, storeDomain, handles)
-
-    if storeDomain not in extHandles:
-        extHandles[storeDomain] = {}
-    if not hasAlready:
-        extHandles[storeDomain][extDomain] = []
-
-        url = f"https://www.discountime.com/system/brand/search"
-        try:
-            response, status = postZenrowsResponse(
-                url,
-                data=json.dumps({"keyWord": storeDomain, "pageNo": 1, "pageSize": 5}),
-            )
-
-            if not response:
-                return extHandles
-
-            jsondata = json.loads(response)
-
-            if "data" in jsondata:
-                if "result" in jsondata["data"]:
-                    result = jsondata["data"]["result"]
-                    # print(result)
-                    for item in result:
-                        logger.info(query["handle"])
-                        logger.info(item["aliasName"])
-                        if query["handle"] == item["aliasName"]:
-                            handle = (
-                                f'https://www.discountime.com/store/{item["aliasName"]}'
-                            )
-                            extHandles[storeDomain][extDomain].append(handle)
-                            break
-
-        except Exception as e:
-            logger.error(f"Error  fetching {url}: {e}")
-
-    return extHandles
+    return unsupported(handles, storeDomain, "discountime", "discountime.com no longer exists (no DNS record)")
 
 
 def karmanow(handles, storeDomain, query):
-    extDomain = "karma"
-    extHandles = handles.copy()
-    hasAlready = isExists(extDomain, storeDomain, handles)
-
-    if storeDomain not in extHandles:
-        extHandles[storeDomain] = {}
-    if not hasAlready:
-        extHandles[storeDomain][extDomain] = []
-        return extHandles
-        # url = f'https://www.karmanow.com/s?query={storeDomain}'
-        # url = f'https://www.karmanow.com/ws/api/my/v1/items?filter[search]=cozyearth.com&page=1&per_page=20&sort_by=created_at&sort_order=desc&include_global=true&include_user=true'
-        # print(f'Fetching {url}...')
-        # try:
-        #     response, status = getZenrowsTwoResponse(url,
-        #         headers={
-        #             'Content-Type': 'A'
-        #             'Authorization': 'Bearer eyJhbGciOiJIUzI1NiJ9.eyJ1c2VyX2lkIjo2Nzg1NTA5LCJleHAiOjE5MDMyNTcwNDZ9.8n5uxXuKknrguNkZU0oiGChumnZVTjF3_QDDRNCyJGY'
-        #         }
-        #     )
-        #     print(response)
-        #     return extHandles
-        #     # print(response.text)
-        #     jsondata = json.loads(response)
-
-        #     # print(jsondata)
-
-        #     if('data' in jsondata):
-        #         if 'result' in jsondata['data']:
-        #             result = jsondata['data']['result']
-        #             # print(result)
-        #             for  item in result:
-        #                 print(query['handle'])
-        #                 print(item['aliasName'])
-        #                 if query['handle'] == item['aliasName']:
-        #                     handle = f'https://www.discountime.com/store/{item["aliasName"]}'
-        #                     extHandles[storeDomain][extDomain].append(handle)
-        #                     break
-
-        # except Exception as e:
-        #     logger.error(f"Error  fetching {url}: {e}")
-
-    return extHandles
+    return unsupported(handles, storeDomain, "karma", "no public store pages, coupons are only in the extension")
 
 
 def rakuten(handles, storeDomain, query):
-    extDomain = "rakuten"
-    extHandles = handles.copy()
-    hasAlready = isExists(extDomain, storeDomain, handles)
+    # The old search used rakuten.ca but built rakuten.com links, which were often 404,
+    # and Rakuten store pages show cash back only, with no coupon codes to fetch.
+    return unsupported(handles, storeDomain, "rakuten", "store pages show cash back only, no coupon codes")
 
-    storeHandle = query["handle"]
-    searchQuery = query["query"]
 
-    if storeDomain not in extHandles:
-        extHandles[storeDomain] = {}
-    if not hasAlready:
-        extHandles[storeDomain][extDomain] = []
-
-        for i, search in enumerate(searchQuery):
-            url = f"https://www.rakuten.ca/srch/suggest?q={search}&rows=10"
-            try:
-                isFound = False
-                response, status = getZenrowsTwoResponse(url)
-                if not response:
-                    continue
-
-                jsondata = json.loads(response)
-
-                if "stores" in jsondata:
-                    for item in jsondata["stores"]:
-                        if "urlName" in item:
-                            path = item["urlName"].replace("-", "")
-                            if path == storeHandle:
-                                handle = f'https://www.rakuten.com/{item["urlName"]}'
-                                extHandles[storeDomain][extDomain].append(handle)
-                                isFound = True
-                                break
-                if isFound:
-                    break
-
-            except Exception as e:
-                logger.error(f"Error  fetching {url}: {e}")
-                continue
-
-    return extHandles
+def hotdeals_search(storeDomain):
+    """Return the store page URL from hotdeals' search API, or None."""
+    url = f"https://beta-api.hotdeals.com/search/get_term_list?keyword={storeDomain}&page_type=home&country_code=US"
+    try:
+        response, status = get_response(url)
+        if status != 200:
+            return None
+        for item in json.loads(response).get("data") or []:
+            if item.get("DomainUrl") == storeDomain and item.get("reUrl"):
+                return item["reUrl"]
+    except Exception as e:
+        logger.error(f"Error fetching {url}: {e}")
+    return None
 
 
 def hotdeals(handles, storeDomain, query):
-    extDomain = "hotdeals"
-    extHandles = handles.copy()
-    hasAlready = isExists(extDomain, storeDomain, handles)
-
-    if storeDomain not in extHandles:
-        extHandles[storeDomain] = {}
-    if not hasAlready:
-        extHandles[storeDomain][extDomain] = []
-
-        url = f"https://beta-api.hotdeals.com/search/get_term_list?keyword={storeDomain}&page_type=home&country_code=US"
-        try:
-            response, status = getZenrowsTwoResponse(url)
-            if not response:
-                return extHandles
-
-            jsondata = json.loads(response)
-
-            if "data" in jsondata:
-                for item in jsondata["data"]:
-                    if "DomainUrl" in item:
-                        if item["DomainUrl"] == storeDomain:
-                            extHandles[storeDomain][extDomain].append(item["reUrl"])
-                            break
-
-        except Exception as e:
-            logger.error(f"Error  fetching {url}: {e}")
-
-    return extHandles
+    # The search API gives the exact page URL cheaply; slug URLs are only a fallback.
+    # Each coupon card has data-merchant="cozyearth.com" ... data-code="GETCOZY50".
+    # Deals have an empty data-code, and cards for other brands have a different merchant.
+    code_pattern = re.compile(rf'data-merchant="{re.escape(storeDomain)}"[^>]*data-code="[^"]+"')
+    search_url = hotdeals_search(storeDomain)
+    return check_site(
+        handles, storeDomain, query, "Hotdeals", "hotdeals",
+        lambda name: [u for u in (search_url, f"https://www.hotdeals.com/coupons/{name}-promo-codes") if u],
+        lambda html: bool(code_pattern.search(html)),
+    )
 
 
 def slickdeals(handles, storeDomain, query):
-    extDomain = "slickdeals"
-    extHandles = handles.copy()
-    hasAlready = isExists(extDomain, storeDomain, handles)
-
-    storeHandle = query["handle"]
-    searchQuery = query["query"]
-
-    if storeDomain not in extHandles:
-        extHandles[storeDomain] = {}
-    if not hasAlready:
-        extHandles[storeDomain][extDomain] = []
-
-        for i, search in enumerate(searchQuery):
-            url = f"https://coupons.slickdeals.net/api/search/a1cf309737e64efba2197ca0d5820b5f/{search}"
-            try:
-                response, status = getZenrowsTwoResponse(url)
-                if not response:
-                    continue
-
-                jsondata = json.loads(response)
-
-                for item in jsondata:
-                    if "url" in item:
-                        refineHandle = item["url"].replace("-", "").replace("/", "")
-                        if refineHandle == storeHandle:
-                            extHandles[storeDomain][extDomain].append(
-                                f'https://coupons.slickdeals.net/{item["url"]}'
-                            )
-                            break
-            except Exception as e:
-                logger.error(f"Error  fetching {url}: {e}")
-                continue
-
-    return extHandles
+    return unsupported(handles, storeDomain, "slickdeals", "coupon pages were removed, every /coupons/ URL returns 410 Gone")
 
 
 def capitalone(handles, storeDomain, query):
-    extDomain = "capitalone"
-    extHandles = handles.copy()
-    hasAlready = isExists(extDomain, storeDomain, handles)
-
-    if storeDomain not in extHandles:
-        extHandles[storeDomain] = {}
-    if not hasAlready:
-        extHandles[storeDomain][extDomain] = []
-
-        url = f"https://capitaloneshopping.com/s/{storeDomain}/coupon"
-        try:
-            response, status = getZenrowsTwoResponse(url)
-            if not response:
-                return extHandles
-
-            soup = BeautifulSoup(response, "html.parser")
-
-            elements = soup.select(".main-column .store-title h1.bold.charcoal")
-            for element in elements:
-                notFoundText = "undefined Coupon Codes, Promo Codes & Discounts"
-                if element.text != notFoundText:
-                    handle = f"https://capitaloneshopping.com/s/{storeDomain}/coupon"
-                    extHandles[storeDomain][extDomain].append(handle)
-                    break
-
-        except Exception as e:
-            logger.error(f"Error  fetching {url}: {e}")
-
-    return extHandles
+    # Each code offer has a button like aria-label="Copy code SHOP10 and open Kohl's in new tab"; deals say "No code required"
+    return check_site(
+        handles, storeDomain, query, "Capital One Shopping", "capitalone",
+        lambda name: f"https://capitaloneshopping.com/s/{storeDomain}/coupon",
+        lambda html: 'aria-label="Copy code ' in html,
+    )
 
 
 def retailmenot(handles, storeDomain, query):
-    logger.info(f"Checking RetailMeNot for: {storeDomain}")
-    extDomain = "retailmenot"
-    extHandles = handles.copy()
-
-    if storeDomain not in extHandles:
-        extHandles[storeDomain] = {}
-    if extDomain not in extHandles[storeDomain]:
-        extHandles[storeDomain][extDomain] = []
-
-    all_names = [query["handle"]] + query["query"]
-    unique_names = list(dict.fromkeys(all_names))
-
-    if storeDomain.endswith(".co"):
-        tld = ".co"
-    else:
-        tld = ".com"
-
-    for name in unique_names:
-        clean_name = name.replace(" ", "-").lower()
-        if clean_name.endswith((".com", ".co")):
-            final_slug = clean_name
-        else:
-            final_slug = f"{clean_name}{tld}"
-
-        url = f"https://www.retailmenot.com/view/{final_slug}"
-
-        if url in extHandles[storeDomain][extDomain]:
-            logger.info(f"Already exists, skipping: {url}")
-            break
-
-        try:
-            logger.info(f"Checking RetailMeNot: {url}")
-            response, status = getZenrowsTwoResponse(url, isProxy=True, isJsRender=True)
-
-            if status == 200:
-                extHandles[storeDomain][extDomain].append(url)
-                logger.info(f"Success! Found on RetailMeNot: {url}")
-                break
-
-            else:
-                logger.info(f"Not found: {url} (Status: {status})")
-
-        except Exception as e:
-            logger.error(f"Error fetching RetailMeNot ({url}): {e}")
-
-    return extHandles
+    # Unknown stores redirect to the homepage. Each offer link carries
+    # x-data="outclickHandler({... 'offerType': 'COUPON', 'requestSlug': 'nike.com' ...})" and the
+    # href has module=expired_offer for expired ones. The code itself is only revealed after a click.
+    # Quotes are HTML-escaped (&#039;) in the raw page, so unescape before matching.
+    codeOffer = re.compile(
+        rf"module=(?!expired_offer)[^&\"]*[^>]*'offerType': 'COUPON', 'requestSlug': '{re.escape(storeDomain)}'"
+    )
+    return check_site(
+        handles, storeDomain, query, "RetailMeNot", "retailmenot",
+        lambda name: f"https://www.retailmenot.com/view/{storeDomain}",
+        lambda html: bool(codeOffer.search(unescape(html))),
+    )
 
 
 def honey(handles, storeDomain, query):
-    extDomain = "honey"
-    extHandles = handles.copy()
-    hasAlready = isExists(extDomain, storeDomain, handles)
+    # Store data is embedded as JSON: "publicCouponCount":3,"publicCoupons":[{"code":"UNLOCKCOZY",...}]
+    def hasCodes(html):
+        match = re.search(r'"publicCouponCount":(\d+)', html)
+        return bool(match) and int(match.group(1)) > 0
 
-    storeHandle = query["handle"]
-    storeQueries = query["query"]
-
-    if storeDomain not in extHandles:
-        extHandles[storeDomain] = {}
-    if not hasAlready:
-        extHandles[storeDomain][extDomain] = []
-
-        isFound = False
-
-        for i, search in enumerate(storeQueries):
-            queryVars = json.dumps({"count": 10, "query": search})
-
-            url = f"https://d.joinhoney.com/v3?operationName=web_autocomplete&variables={queryVars}"
-
-            try:
-                response, status = getZenrowsTwoResponse(url)
-                if not response:
-                    continue
-
-                jsondata = json.loads(response) if response else {}
-
-                if "data" in jsondata:
-                    data = jsondata["data"]
-                    if "autocomplete" in data:
-                        autocomplete = data["autocomplete"]
-                        if "stores" in autocomplete:
-                            results = autocomplete["stores"]
-                            for item in results:
-                                refineHandle1 = item["name"].replace(" ", "").lower()
-                                refineHandle2 = item["label"].replace("-", "").lower()
-
-                                if (
-                                    storeHandle in refineHandle1
-                                    or storeHandle in refineHandle2
-                                ):
-                                    handle = f'https://www.joinhoney.com/shop/{item["label"]}'
-                                    extHandles[storeDomain][extDomain].append(handle)
-                                    isFound = True
-                                    break
-                if isFound:
-                    break
-
-            except Exception as e:
-                logger.error(f"Error  fetching {url}: {e}")
-                continue
-
-    return extHandles
+    return check_site(
+        handles, storeDomain, query, "Honey", "honey",
+        lambda name: f"https://www.joinhoney.com/shop/{name}",
+        hasCodes,
+    )
 
 
 def rebates(handles, storeDomain, query):
@@ -573,999 +255,289 @@ def rebates(handles, storeDomain, query):
 
 
 def coupons(handles, storeDomain, query):
-    extDomain = "coupons"
-    extHandles = handles.copy()
-
-    if storeDomain not in extHandles:
-        extHandles[storeDomain] = {}
-    if extDomain not in extHandles[storeDomain]:
-        extHandles[storeDomain][extDomain] = []
-
-    all_names = [query["handle"]] + query["query"]
-    unique_names = list(dict.fromkeys(all_names))
-
-    for name in unique_names:
-        clean_name = name.replace(" ", "-").lower()
-        url = f"https://www.coupons.com/coupon-codes/{clean_name}/"
-
-        if url in extHandles[storeDomain][extDomain]:
-            logger.info(f"Already found, skipping: {url}")
-            break
-
-        try:
-            logger.info(f"Checking Coupons.com: {url}")
-            response, status = getZenrowsTwoResponse(url)
-            logger.info("the status is", status)
-
-            if status == 200:
-                extHandles[storeDomain][extDomain].append(url)
-                logger.info(f"Success! Valid Store Page on Coupons.com: {url}")
-                break
-            else:
-                logger.info(f"Not found: {url} (Status: {status})")
-
-        except Exception as e:
-            logger.error(f"Error fetching Coupons.com ({url}): {e}")
-
-    return extHandles
+    # Vouchers are escaped JSON inside a script: \"code\":\"WELCOME10\",\"description\":...
+    # Matching the following "description" key skips unrelated "code" keys such as icon names.
+    codePattern = re.compile(r'\\"code\\":\\"[^\\"]+\\",\\"description')
+    return check_site(
+        handles, storeDomain, query, "Coupons.com", "coupons",
+        lambda name: f"https://www.coupons.com/coupon-codes/{name}",
+        lambda html: bool(codePattern.search(html)),
+    )
 
 
 def dealcatcher(handles, storeDomain, query):
-    extDomain = "dealcatcher"
-    extHandles = handles.copy()
-    hasAlready = isExists(extDomain, storeDomain, handles)
+    # Offers live in the Nuxt payload (<script id="__NUXT_DATA__">), a flat JSON array where each
+    # field holds the index of its value. Even big stores mostly have empty codes, so this is often empty.
+    def hasCodes(html):
+        match = re.search(r'<script[^>]*id="__NUXT_DATA__"[^>]*>(.*?)</script>', html, re.S)
+        if not match:
+            return False
+        data = json.loads(match.group(1))
+        for item in data:
+            if isinstance(item, dict) and "code" in item and "merchant_id" in item:
+                code = data[item["code"]]
+                if isinstance(code, str) and code.strip():
+                    return True
+        return False
 
-    if storeDomain not in extHandles:
-        extHandles[storeDomain] = {}
-    if not hasAlready:
-        extHandles[storeDomain][extDomain] = []
-        return extHandles
-
-        url = f"https://www.dealcatcher.com/coupons/{storeDomain}"
-
-        try:
-            response, status = getZenrowsTwoResponse(url)
-            if status == 200:
-                extHandles[storeDomain][extDomain].append(url)
-
-        except Exception as e:
-            logger.error(f"Error  fetching {url}: {e}")
-
-    return extHandles
+    return check_site(
+        handles, storeDomain, query, "DealCatcher", "dealcatcher",
+        lambda name: f"https://www.dealcatcher.com/coupons/{name}",
+        hasCodes,
+    )
 
 
 def dontpayfull(handles, storeDomain, query):
-    extDomain = "dontpayfull"
-    extHandles = handles.copy()
-    hasAlready = isExists(extDomain, storeDomain, handles)
+    # Active offers sit in <div id="active-coupons">, expired ones in <div id="expired-coupons">.
+    # Each offer is an <article class="card obox code"> or "card obox deal". Active codes stay hidden until
+    # clicked (only expired ones show data-clipboard-text), so count active code cards instead.
+    def hasCodes(html):
+        active = BeautifulSoup(html, "html.parser").select_one("#active-coupons")
+        return bool(active and active.select_one("article.code"))
 
-    if storeDomain not in extHandles:
-        extHandles[storeDomain] = {}
-    if not hasAlready:
-        extHandles[storeDomain][extDomain] = []
-        url = f"https://www.dontpayfull.com/at/{storeDomain}"
-
-        try:
-            response, status = getZenrowsTwoResponse(url)
-            if not response:
-                return extHandles
-            if status == 200:
-                extHandles[storeDomain][extDomain].append(url)
-
-        except Exception as e:
-            logger.error(f"Error  fetching {url}: {e}")
-
-    return extHandles
+    return check_site(
+        handles, storeDomain, query, "DontPayFull", "dontpayfull",
+        lambda name: f"https://www.dontpayfull.com/at/{storeDomain}",
+        hasCodes,
+    )
 
 
-def offers(handles, storeDomain, query, algolia):
-    extDomain = "offers"
-    extHandles = handles.copy()
-    storeHandle = query["handle"]
-    storeQueries = query["query"]
-    hasAlready = isExists(extDomain, storeDomain, handles)
-    try:
-        app_id = algolia[extDomain]["app-id"]
-        api_key = algolia[extDomain]["api-key"]
+def offers(handles, storeDomain, query, algolia=None):
+    # Unknown stores redirect to the homepage, which also has code offers, so require a /stores/ canonical.
+    # Code offers have "hasCode: true" in the link's click handler; the code is revealed only after a click.
+    def hasCodes(html):
+        canonical = re.search(r'<link rel="canonical" href="([^"]+)"', html)
+        return bool(canonical) and "/stores/" in canonical.group(1) and "hasCode: true" in unescape(html)
 
-        if storeDomain not in extHandles:
-            extHandles[storeDomain] = {}
-        if not hasAlready:
-            extHandles[storeDomain][extDomain] = []
-
-            isFound = False
-            url = f"https://{app_id.lower()}-dsn.algolia.net/1/indexes/*/queries?x-algolia-agent=Algolia%20for%20JavaScript%20(4.24.0)%3B%20Browser"
-
-            for i, search in enumerate(storeQueries):
-                try:
-                    response, status = postZenrowsResponse(
-                        url,
-                        data=json.dumps(
-                            {
-                                "requests": [
-                                    {
-                                        "indexName": "production_companies",
-                                        "query": search,
-                                        "params": "hitsPerPage=3",
-                                    }
-                                ]
-                            }
-                        ),
-                        headers={
-                            "X-Algolia-API-Key": api_key,
-                            "X-Algolia-Application-Id": app_id,
-                            "Content-Type": "application/json",
-                        },
-                    )
-                    if not response:
-                        continue
-                    jsondata = json.loads(response)
-
-                    if "results" in jsondata:
-                        results = jsondata["results"]
-                        for result in results:
-                            if "hits" in result:
-                                hits = result["hits"]
-                                for hit in hits:
-                                    if "url" in hit and storeHandle in hit["url"]:
-                                        handle = f'https://www.offers.com{hit["url"]}'
-                                        extHandles[storeDomain][extDomain].append(
-                                            handle
-                                        )
-                                        isFound = True
-                                        break
-                            if isFound:
-                                break
-                    if isFound:
-                        break
-
-                except Exception as e:
-                    logger.error(f"Error  fetching {url}: {e}")
-                    continue
-
-        return extHandles
-    except Exception as e:
-        logger.error(f"Error {e}")
-        return extHandles
+    return check_site(
+        handles, storeDomain, query, "Offers.com", "offers",
+        # Some stores carry a country suffix, e.g. /stores/macys-us/
+        lambda name: [f"https://www.offers.com/stores/{name}/", f"https://www.offers.com/stores/{name}-us/"],
+        hasCodes,
+    )
 
 
 def savings(handles, storeDomain, query):
-    extDomain = "savings"
-    extHandles = handles.copy()
-    hasAlready = isExists(extDomain, storeDomain, handles)
+    # Code offers are <div class="module-deal ... hasCode ..." data-provider-name="Kohl's">.
+    # The page also shows code offers from other (sponsored) brands, so match the provider to the store.
+    names = {normalize(name) for name in slugs(query)}
 
-    if storeDomain not in extHandles:
-        extHandles[storeDomain] = {}
-    if not hasAlready:
-        extHandles[storeDomain][extDomain] = []
-        url = f"https://www.savings.com/coupons/{storeDomain}"
+    def hasCodes(html):
+        providers = re.findall(r'class="module-deal [^"]*\bhasCode\b[^"]*"[^>]*data-provider-name="([^"]+)"', html)
+        return any(normalize(unescape(provider)) in names for provider in providers)
 
-        try:
-            response, status = getZenrowsTwoResponse(url)
-            if not response:
-                return extHandles
-            if status == 200:
-                extHandles[storeDomain][extDomain].append(url)
-
-        except Exception as e:
-            logger.error(f"Error  fetching {url}: {e}")
-
-    return extHandles
+    return check_site(
+        handles, storeDomain, query, "Savings.com", "savings",
+        lambda name: f"https://www.savings.com/coupons/{storeDomain}",
+        hasCodes,
+    )
 
 
 def dealspotr(handles, storeDomain, query):
-    logger.info(f"Checking Dealspotr for: {storeDomain}")
-    extDomain = "dealspotr"
-    extHandles = handles.copy()
-
-    if storeDomain not in extHandles:
-        extHandles[storeDomain] = {}
-    if extDomain not in extHandles[storeDomain]:
-        extHandles[storeDomain][extDomain] = []
-
-    all_names = [query["handle"]] + query["query"]
-    unique_names = list(dict.fromkeys(all_names))
-
-    if storeDomain.endswith(".co"):
-        tld = ".co"
-    else:
-        tld = ".com"
-
-    for name in unique_names:
-        clean_name = name.replace(" ", "-").lower()
-
-        if clean_name.endswith((".com", ".co")):
-            final_slug = f"{clean_name}{tld}"
-        else:
-            final_slug = f"{clean_name}"
-
-        url = f"https://dealspotr.com/promo-codes/{final_slug}"
-
-        if url in extHandles[storeDomain][extDomain]:
-            logger.info(f"Already exists, skipping: {url}")
-            break
-
-        try:
-            logger.info(f"Checking Dealspotr: {url}")
-            response, status = postZenrowsResponse(url)
-            logger.info("What is the status here:", status)
-
-            if status == 200:
-                extHandles[storeDomain][extDomain].append(url)
-                logger.info(f"Success! Found on Dealspotr: {url}")
-                break
-
-            else:
-                logger.info(f"Not found: {url} (Status: {status})")
-
-        except Exception as e:
-            logger.error(f"Error fetching Dealspotr ({url}): {e}")
-
-    return extHandles
+    return unsupported(handles, storeDomain, "dealspotr", "every store page redirects to SimplyCodes, use simplycodes() instead")
 
 
 def promocodes(handles, storeDomain, query):
-    extDomain = "promocodes"
-    extHandles = handles.copy()
-    hasAlready = isExists(extDomain, storeDomain, handles)
-
-    storeHandle = query["handle"]
-    storeQueries = query["query"]
-
-    if storeDomain not in extHandles:
-        extHandles[storeDomain] = {}
-    if not hasAlready:
-        extHandles[storeDomain][extDomain] = []
-
-        for i, search in enumerate(storeQueries):
-            url = f"https://www.promocodes.com/api/search"
-            try:
-                response, status = postZenrowsResponse(
-                    url,
-                    data=json.dumps(
-                        {"includeCategories": True, "onlyCashback": False, "q": search}
-                    ),
-                    headers={
-                        "Content-Type": "application/json",
-                        "Referer": "https://www.promocodes.com",
-                    },
-                )
-                if not response:
-                    continue
-                jsondata = json.loads(response) if response else {}
-
-                if "data" in jsondata:
-                    data = jsondata["data"]
-                    if "merchants" in data:
-                        for item in data["merchants"]:
-                            slug = item["slug"]
-                            refineHandle = slug.replace("-", "").replace("/", "")
-                            if storeHandle in refineHandle:
-                                handle = f"https://www.promocodes.com/{slug}-coupons"
-                                extHandles[storeDomain][extDomain].append(handle)
-                                break
-
-            except Exception as e:
-                logger.error(f"Error  fetching {url}: {e}")
-                continue
-
-    return extHandles
+    # Offers are embedded JSON: "couponCode":"GETCOZY"; deals have "couponCode":null
+    return check_site(
+        handles, storeDomain, query, "PromoCodes.com", "promocodes",
+        lambda name: f"https://www.promocodes.com/{name}-coupons",
+        lambda html: bool(re.search(r'"couponCode":"[^"]+"', html)),
+    )
 
 
 def couponchief(handles, storeDomain, query):
-    extDomain = "couponchief"
-    extHandles = handles.copy()
-    hasAlready = isExists(extDomain, storeDomain, handles)
+    # Store coupons are <div id="coupon_7133304" data-coupon-id="7133304"> cards; a code card has a
+    # <span class="coupon-code covered-coupon-code"> showing only the last character.
+    # Sidebar cards for other stores have no data-coupon-id, so they are skipped.
+    # Expired cards say "Expired over one year ago" and don't count.
+    def hasCodes(html):
+        soup = BeautifulSoup(html, "html.parser")
+        return any(
+            card.select_one(".covered-coupon-code") and "Expired" not in card.get_text()
+            for card in soup.select("[data-coupon-id]")
+        )
 
-    if storeDomain not in extHandles:
-        extHandles[storeDomain] = {}
-    if not hasAlready:
-        extHandles[storeDomain][extDomain] = []
-
-        url = f"https://www.couponchief.com/ajaxsearch/store_search.php"
-
-        try:
-            response, status = postZenrowsResponse(
-                url,
-                data=f"tb_search={storeDomain}",
-                headers={
-                    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8"
-                },
-            )
-            if not response:
-                return extHandles
-            jsondata = json.loads(response) if response else []
-
-            # Ensure jsondata is a list
-            if not isinstance(jsondata, list):
-                return extHandles
-
-            for item in jsondata:
-                # Ensure item is a dictionary before accessing keys
-                if not isinstance(item, dict):
-                    continue
-
-                if "path" not in item or "label" not in item:
-                    continue
-
-                path = item["path"]
-                label = item["label"]
-
-                if label:
-                    soup = BeautifulSoup(label, "html.parser")
-                    domain_element = soup.find("span", class_="storeSearchLabel")
-                    if not domain_element or not domain_element.text:
-                        continue
-                    domain = domain_element.text
-
-                    if domain.lower() == storeDomain.lower():
-                        path = path.replace("\\", "")
-                        handle = f"https://www.couponchief.com{path}"
-                        extHandles[storeDomain][extDomain].append(handle)
-                        break
-
-        except Exception as e:
-            logger.error(f"Error  fetching {url}: {e}")
-
-    return extHandles
+    return check_site(
+        handles, storeDomain, query, "CouponChief", "couponchief",
+        lambda name: f"https://www.couponchief.com/{name}",
+        hasCodes,
+    )
 
 
 def goodshop(handles, storeDomain, query):
-    extDomain = "goodshop"
-    extHandles = handles.copy()
-    hasAlready = isExists(extDomain, storeDomain, handles)
-
-    if storeDomain not in extHandles:
-        extHandles[storeDomain] = {}
-    if not hasAlready:
-        extHandles[storeDomain][extDomain] = []
-
-        url = f"https://www.goodshop.com/shop/merchants?term={storeDomain}"
-
-        try:
-            response, status = getZenrowsTwoResponse(url)
-            if not response:
-                return extHandles
-            jsondata = json.loads(response) if response else []
-
-            for item in jsondata:
-                if storeDomain in item["urlname"]:
-                    handle = f"https://www.goodshop.com/coupons/{storeDomain}"
-                    extHandles[storeDomain][extDomain].append(handle)
-                    break
-
-        except Exception as e:
-            logger.error(f"Error  fetching {url}: {e}")
-
-    return extHandles
+    # JSON-LD lists each offer as {"@id":"https://www.goodshop.com/coupons/cozyearth.com#72866609", ...,
+    # "discountCode":"CE-DISCOVERELLE"}. Most codes are masked ("••••••AN") but still mean a code exists.
+    codePattern = re.compile(rf'coupons/{re.escape(storeDomain)}#\d+"[^{{}}]*"discountCode":"[^"]+"')
+    return check_site(
+        handles, storeDomain, query, "Goodshop", "goodshop",
+        lambda name: f"https://www.goodshop.com/coupons/{storeDomain}",
+        lambda html: bool(codePattern.search(html)),
+    )
 
 
 def simplycodes(handles, storeDomain, query):
-    extDomain = "simplycodes"
-    extHandles = handles.copy()
-    hasAlready = isExists(extDomain, storeDomain, handles)
-
-    if storeDomain not in extHandles:
-        extHandles[storeDomain] = {}
-    if not hasAlready:
-        extHandles[storeDomain][extDomain] = []
-
-        url = f"https://api.simplycodes.com/v2/merchants/search?query={storeDomain}&isUs=true"
-
-        try:
-            response, status = getZenrowsTwoResponse(url)
-            if not response:
-                return extHandles
-            jsondata = json.loads(response) if response else {}
-
-            if "merchants" in jsondata:
-                for item in jsondata["merchants"]:
-                    if (
-                        storeDomain in item["urlSlug"]
-                        or storeDomain in item["displayUrl"]
-                    ):
-                        handle = f'https://simplycodes.com/store/{item["urlSlug"]}'
-                        extHandles[storeDomain][extDomain].append(handle)
-                        break
-
-        except Exception as e:
-            logger.error(f"Error  fetching {url}: {e}")
-
-    return extHandles
+    # Code buttons look like data-code="COZY15" ... data-merchant-url="https://cozyearth.com/".
+    # Buttons for related stores use data-merchant-url="/store/other.com", so match the store's own URL.
+    codePattern = re.compile(rf'data-code="[^"]+"[^>]*data-merchant-url="https?://(www\.)?{re.escape(storeDomain)}')
+    return check_site(
+        handles, storeDomain, query, "SimplyCodes", "simplycodes",
+        lambda name: f"https://simplycodes.com/store/{storeDomain}",
+        lambda html: bool(codePattern.search(html)),
+    )
 
 
 def tenereteam(handles, storeDomain, query):
-    extDomain = "tenereteam"
-    extHandles = handles.copy()
-    hasAlready = isExists(extDomain, storeDomain, handles)
-
-    storeHandle = query["handle"]
-    storeQueries = query["query"]
-
-    if storeDomain not in extHandles:
-        extHandles[storeDomain] = {}
-    if not hasAlready:
-        extHandles[storeDomain][extDomain] = []
-
-        isFound = False
-        for i, search in enumerate(storeQueries):
-            url = f"https://www.tenereteam.com/v2/store/search?q={search}"
-
-            try:
-                response, status = getZenrowsTwoResponse(url)
-                if not response:
-                    continue
-
-                jsondata = json.loads(response) if response else []
-                # Ensure jsondata is not None and is iterable (list or dict)
-                if jsondata is None:
-                    jsondata = []
-                # If it's a string, try to parse it again or skip
-                if isinstance(jsondata, str):
-                    try:
-                        jsondata = json.loads(jsondata)
-                    except (ValueError, TypeError):
-                        logger.warning(
-                            f"Invalid JSON format from {url}: got string instead of list/dict"
-                        )
-                        continue
-                # Ensure it's a list or dict, convert dict to list of values if needed
-                if not isinstance(jsondata, (list, dict)):
-                    logger.warning(f"Unexpected JSON type from {url}: {type(jsondata)}")
-                    continue
-                # Convert dict to list if needed
-                if isinstance(jsondata, dict):
-                    jsondata = list(jsondata.values()) if jsondata else []
-
-                for item in jsondata:
-                    # Ensure item is a dict before accessing keys
-                    if not isinstance(item, dict):
-                        continue
-                    if "alias" not in item or "name" not in item:
-                        continue
-                    refineHandle1 = (
-                        item["alias"].replace("-", "").replace("\\", "").lower()
-                    )
-                    refineHandle2 = item["name"].replace(" ", "").lower()
-                    if storeHandle in refineHandle1 or storeHandle in refineHandle2:
-                        handle = f'https://{item["alias"]}.tenereteam.com/coupons'
-                        extHandles[storeDomain][extDomain].append(handle)
-                        isFound = True
-                        break
-                if isFound:
-                    break
-            except Exception as e:
-                logger.error(f"Error  fetching {url}: {e}")
-                continue
-
-    return extHandles
+    # Each store has its own subdomain. Offers are escaped JSON inside the Next.js payload:
+    # \"coupon_code\":\"WELCOME10\"
+    codePattern = re.compile(r'\\"coupon_code\\":\\"[^\\"]+\\"')
+    return check_site(
+        handles, storeDomain, query, "TenereTeam", "tenereteam",
+        lambda name: f"https://{name}.tenereteam.com/coupons",
+        lambda html: bool(codePattern.search(html)),
+    )
 
 
 def couponcause(handles, storeDomain, query):
-    extDomain = "couponcause"
-    extHandles = handles.copy()
-    hasAlready = isExists(extDomain, storeDomain, handles)
+    # Unknown stores return status 200 with an "Oops Page Not Found!" page whose canonical is /404/.
+    # Code offers link to data-redirect-url="/stores/cozy-earth/?_c=20099"; deals have no ?_c=.
+    def hasCodes(html):
+        canonical = re.search(r'<link rel="canonical" href="([^"]+)"', html)
+        return (
+            bool(canonical) and "/stores/" in canonical.group(1)
+            and bool(re.search(r'data-redirect-url="/stores/[^"]+\?_c=\d+"', html))
+        )
 
-    storeHandle = query["handle"]
-    storeQueries = query["query"]
-
-    if storeDomain not in extHandles:
-        extHandles[storeDomain] = {}
-    if not hasAlready:
-        extHandles[storeDomain][extDomain] = []
-        isFound = False
-
-        for i, search in enumerate(storeQueries):
-            url = f"https://couponcause.com/ajax?merchant={search}"
-
-            try:
-                response, status = getZenrowsTwoResponse(url)
-                if not response:
-                    continue
-                jsondata = json.loads(response) if response else {}
-                if "merchants" in jsondata:
-                    for item in jsondata["merchants"]:
-                        refineHandle1 = item["url"].replace("-", "").lower()
-                        refineHandle2 = item["name"].replace(" ", "").lower()
-                        if storeHandle in refineHandle1 or storeHandle in refineHandle2:
-                            handle = f'https://couponcause.com{item["url"]}'
-                            extHandles[storeDomain][extDomain].append(handle)
-                            isFound = True
-                            break
-
-                if isFound:
-                    break
-
-            except Exception as e:
-                logger.error(f"Error  fetching {url}: {e}")
-                continue
-
-    return extHandles
+    return check_site(
+        handles, storeDomain, query, "CouponCause", "couponcause",
+        lambda name: f"https://couponcause.com/stores/{name}/",
+        hasCodes,
+    )
 
 
 def goodsearch(handles, storeDomain, query):
-    extDomain = "goodsearch"
-    extHandles = handles.copy()
-    hasAlready = isExists(extDomain, storeDomain, handles)
-
-    if storeDomain not in extHandles:
-        extHandles[storeDomain] = {}
-    if not hasAlready:
-        extHandles[storeDomain][extDomain] = []
-        url = f"https://www.goodsearch.com/coupons/{storeDomain}"
-
-        try:
-            response, status = getZenrowsTwoResponse(url)
-            if not response:
-                return extHandles
-            if status == 200:
-                extHandles[storeDomain][extDomain].append(url)
-
-        except Exception as e:
-            logger.error(f"Error  fetching {url}: {e}")
-
-    return extHandles
+    # Same company and page layout as Goodshop: JSON-LD offers with "discountCode", mostly masked
+    codePattern = re.compile(rf'coupons/{re.escape(storeDomain)}#\d+"[^{{}}]*"discountCode":"[^"]+"')
+    return check_site(
+        handles, storeDomain, query, "Goodsearch", "goodsearch",
+        lambda name: f"https://www.goodsearch.com/coupons/{storeDomain}",
+        lambda html: bool(codePattern.search(html)),
+    )
 
 
 def valuecom(handles, storeDomain, query):
-    extDomain = "valuecom"
-    extHandles = handles.copy()
-    hasAlready = isExists(extDomain, storeDomain, handles)
-
-    storeHandle = query["handle"]
-    storeQueries = query["query"]
-
-    if storeDomain not in extHandles:
-        extHandles[storeDomain] = {}
-    if not hasAlready:
-        extHandles[storeDomain][extDomain] = []
-        isFound = False
-
-        for i, search in enumerate(storeQueries):
-            url = f"https://www.valuecom.com/api/search?wd={search}"
-
-            try:
-                response, status = postZenrowsResponse(url)
-                if not response:
-                    continue
-                jsondata = json.loads(response) if response else {}
-
-                if "data" in jsondata:
-                    for item in jsondata["data"]:
-                        if storeDomain in item["domain"]:
-                            handle = item["urlname"]
-                            extHandles[storeDomain][extDomain].append(handle)
-                            isFound = True
-                            break
-
-                if isFound:
-                    break
-
-            except Exception as e:
-                logger.error(f"Error  fetching {url}: {e}")
-                continue
-
-    return extHandles
+    # Stores live on subdomains like cozyearth.valuecom.com (no hyphens); a few use store{name}.valuecom.com.
+    # Offers are JSON-LD: {"@type":"Offer", ..., "couponCode":"SAMANTHA55", ...}
+    return check_site(
+        handles, storeDomain, query, "Valuecom", "valuecom",
+        lambda name: [
+            f"https://{name.replace('-', '')}.valuecom.com/",
+            f"https://store{name.replace('-', '')}.valuecom.com/",
+        ],
+        lambda html: bool(re.search(r'"couponCode":"[^"]+"', html)),
+    )
 
 
 def lovecoupons(handles, storeDomain, query):
-    extDomain = "lovecoupons"
-    extHandles = handles.copy()
-    hasAlready = isExists(extDomain, storeDomain, handles)
+    # Offers are <article class="Offer ..." data-type="2" ... data-brand-slug="/cozy-earth">.
+    # data-type 2 is a coupon (code), 3 is a sale and 9 is shipping, so only type 2 counts.
+    names = set(slugs(query))
 
-    storeHandle = query["handle"]
-    storeQueries = query["query"]
+    def hasCodes(html):
+        offers = re.findall(r'<article class="Offer[^"]*"[^>]*data-type="2"[^>]*data-brand-slug="/([^"]+)"', html)
+        return any(slug in names for slug in offers)
 
-    if storeDomain not in extHandles:
-        extHandles[storeDomain] = {}
-    if not hasAlready:
-        extHandles[storeDomain][extDomain] = []
-        isFound = False
-
-        for i, search in enumerate(storeQueries):
-            url = f"https://www.lovecoupons.com/search/term?q={search}"
-
-            try:
-                response, status = getZenrowsTwoResponse(
-                    url, isProxy=True, isJsRender=True
-                )
-                if not response:
-                    continue
-
-                if response is not None:
-                    soup = BeautifulSoup(response, "html.parser")
-                    elements = soup.select("ul li a")
-                    for element in elements:
-                        href = element.get("href")
-                        refineHandle = href.replace("-", "").replace("/", "")
-                        if storeHandle in refineHandle:
-                            handle = f"https://www.lovecoupons.com{href}"
-                            extHandles[storeDomain][extDomain].append(handle)
-                            isFound = True
-                            break
-
-                if isFound:
-                    break
-
-            except Exception as e:
-                logger.error(f"Error  fetching {url}: {e}")
-                continue
-
-    return extHandles
+    return check_site(
+        handles, storeDomain, query, "Love Coupons", "lovecoupons",
+        lambda name: f"https://www.lovecoupons.com/{name}",
+        hasCodes,
+    )
 
 
 def knoji(handles, storeDomain, query):
-    extDomain = "knoji"
-    extHandles = handles.copy()
-    hasAlready = isExists(extDomain, storeDomain, handles)
-
-    storeHandle = query["handle"]
-    storeQueries = query["query"]
-
-    if storeDomain not in extHandles:
-        extHandles[storeDomain] = {}
-    if not hasAlready:
-        extHandles[storeDomain][extDomain] = []
-        isFound = False
-
-        for i, search in enumerate(storeQueries):
-            url = f"https://knoji.com/lookup-jump/all/?term={search}"
-
-            try:
-                response, status = getZenrowsTwoResponse(
-                    url, isProxy=True, isJsRender=True
-                )
-                if not response:
-                    continue
-
-                jsondata = json.loads(response) if response else []
-                # Ensure jsondata is not None and is iterable
-                if jsondata is None or not isinstance(jsondata, (list, dict)):
-                    jsondata = []
-                # Convert dict to list if needed
-                if isinstance(jsondata, dict):
-                    jsondata = list(jsondata.values()) if jsondata else []
-
-                for item in jsondata:
-                    if (
-                        not isinstance(item, dict)
-                        or "label" not in item
-                        or "url" not in item
-                    ):
-                        continue
-                    refineHandle1 = item["label"].replace("-", "").lower()
-                    refineHandle2 = item["url"].replace("-", "").lower()
-                    if storeHandle in refineHandle1 or storeHandle in refineHandle2:
-                        extHandles[storeDomain][extDomain].append(item["url"])
-                        isFound = True
-                        break
-
-                if isFound:
-                    break
-
-            except Exception as e:
-                logger.error(f"Error  fetching {url}: {e}")
-                continue
-
-    return extHandles
+    return unsupported(handles, storeDomain, "knoji", "every store URL returns 410 Gone and the homepage redirects to SimplyCodes, use simplycodes() instead")
 
 
 def swagbucks(handles, storeDomain, query):
-    extDomain = "swagbucks"
-    extHandles = handles.copy()
-    hasAlready = isExists(extDomain, storeDomain, handles)
-
-    storeHandle = query["handle"]
-    storeQueries = query["query"]
-
-    if storeDomain not in extHandles:
-        extHandles[storeDomain] = {}
-    if not hasAlready:
-        extHandles[storeDomain][extDomain] = []
-        isFound = False
-
-        for i, search in enumerate(storeQueries):
-            url = f"https://www.swagbucks.com/?cmd=sh-search-autocomplete&term={search}"
-
-            try:
-                response, status = postZenrowsResponse(url)
-                if not response:
-                    continue
-
-                jsondata = json.loads(response) if response else {}
-
-                if "data" in jsondata:
-                    for item in jsondata["data"]:
-                        if item["category"] == "Stores":
-                            refineHandle1 = item["name"].replace(" ", "").lower()
-                            refineHandle2 = item["url"].replace("-", "").lower()
-                            if (
-                                storeHandle in refineHandle1
-                                or storeHandle in refineHandle2
-                            ):
-                                handle = item["url"].split("?")[0]
-                                path_url = f"www.swagbucks.com{handle}"
-                                extHandles[storeDomain][extDomain].append(path_url)
-                                isFound = True
-                                break
-
-                if isFound:
-                    break
-
-            except Exception as e:
-                logger.error(f"Error  fetching {url}: {e}")
-                continue
-
-    return extHandles
+    return unsupported(handles, storeDomain, "swagbucks", "store pages show cash back only, no coupon codes")
 
 
 def joinsmarty(handles, storeDomain, query):
-    extDomain = "joinsmarty"
-    extHandles = handles.copy()
-    hasAlready = isExists(extDomain, storeDomain, handles)
-
-    storeHandle = query["handle"]
-    storeQueries = query["query"]
-
-    if storeDomain not in extHandles:
-        extHandles[storeDomain] = {}
-    if not hasAlready:
-        extHandles[storeDomain][extDomain] = []
-        isFound = False
-        return extHandles
-
-    return extHandles
+    return unsupported(handles, storeDomain, "joinsmarty", "no public store pages, store lists only show after signing up")
 
 
 def rebatesme(handles, storeDomain, query):
-    extDomain = "rebatesme"
-    extHandles = handles.copy()
-    hasAlready = isExists(extDomain, storeDomain, handles)
+    # Unknown stores return a generic stores page with status 200, so match urlNameInpage to our slug.
+    # Store coupons are in `var couponListObj = [...]`; a code looks like "couponCodeList":[{"code":"EARLY",...}]
+    def hasCodes(html):
+        urlName = re.search(r'var urlNameInpage = "([^"]+)"', html)
+        coupons = re.search(r"var couponListObj = (.*?);\s*\n", html)
+        return (
+            bool(urlName) and urlName.group(1) in slugs(query)
+            and bool(coupons) and '"couponCodeList":[{"code":"' in coupons.group(1)
+        )
 
-    storeHandle = query["handle"]
-    storeQueries = query["query"]
-
-    if storeDomain not in extHandles:
-        extHandles[storeDomain] = {}
-    if not hasAlready:
-        extHandles[storeDomain][extDomain] = []
-        isFound = False
-        url = f"https://www.rebatesme.com/guest-api/rest/search-keywords"
-        for i, search in enumerate(storeQueries):
-            try:
-                response, status = postZenrowsResponse(
-                    url,
-                    data=json.dumps(
-                        {
-                            "pageNo": 1,
-                            "pageSize": 5,
-                            "keywords": search,
-                            "searchType": "all",
-                        }
-                    ),
-                    headers={
-                        "Content-Type": "application/json",
-                        "Referer": "https://www.rebatesme.com",
-                    },
-                )
-                if not response:
-                    continue
-
-                jsondata = json.loads(response) if response else {}
-
-                if "data" in jsondata:
-                    data = jsondata["data"]
-                    if "resultMap" in data:
-                        resultMap = data["resultMap"]
-                        if "store" in resultMap:
-                            result = resultMap["store"]
-                            if "list" in result:
-                                for item in result["list"]:
-                                    refineHandle1 = (
-                                        item["displayName"].replace(" ", "").lower()
-                                    )
-                                    refineHandle2 = item["url"].replace("-", "").lower()
-                                    if (
-                                        storeHandle in refineHandle1
-                                        or storeHandle in refineHandle2
-                                    ):
-                                        extHandles[storeDomain][extDomain].append(
-                                            item["url"]
-                                        )
-                                        isFound = True
-                                        break
-                if isFound:
-                    break
-
-            except Exception as e:
-                logger.error(f"Error  fetching {url}: {e}")
-                continue
-
-    return extHandles
+    return check_site(
+        handles, storeDomain, query, "RebatesMe", "rebatesme",
+        lambda name: f"https://www.rebatesme.com/en/stores/{name}",
+        hasCodes,
+    )
 
 
 def refermate(handles, storeDomain, query):
-    extDomain = "refermate"
-    extHandles = handles.copy()
-    hasAlready = isExists(extDomain, storeDomain, handles)
-
-    storeHandle = query["handle"]
-    storeQueries = query["query"]
-
-    if storeDomain not in extHandles:
-        extHandles[storeDomain] = {}
-    if not hasAlready:
-        extHandles[storeDomain][extDomain] = []
-        isFound = False
-
-        for i, search in enumerate(storeQueries):
-            url = f"https://www.refermate.com/api/search?keyword={search}"
-
-            try:
-                response, status = getZenrowsTwoResponse(url)
-                jsondata = json.loads(response) if response else {}
-
-                if "data" in jsondata:
-                    for item in jsondata["data"]:
-                        refineHandle1 = item["name"].replace(" ", "").lower()
-                        refineHandle2 = item["url"].replace("-", "").lower()
-                        if storeHandle in refineHandle1 or storeHandle in refineHandle2:
-                            handle = f'https://www.refermate.com{item["url"]}'
-                            extHandles[storeDomain][extDomain].append(handle)
-                            isFound = True
-                            break
-
-                if isFound:
-                    break
-
-            except Exception as e:
-                logger.error(f"Error  fetching {url}: {e}")
-                continue
-
-    return extHandles
+    # Codes are escaped JSON in the Next.js payload: \"couponCode\":\"HONEY10\"; deals say "No Code Needed"
+    codePattern = re.compile(r'\\"couponCode\\":\\"(?!No Code Needed)[^\\"]+\\"')
+    return check_site(
+        handles, storeDomain, query, "Refermate", "refermate",
+        lambda name: f"https://refermate.com/store/{name}/promo-codes",
+        lambda html: bool(codePattern.search(html)),
+    )
 
 
 def discountreactor(handles, storeDomain, query):
-    extDomain = "discountreactor"
-    extHandles = handles.copy()
-    hasAlready = isExists(extDomain, storeDomain, handles)
+    # Store pages use the domain (/coupons/cozyearth.com) or a plain name (/coupons/lindseyleighjewelry).
+    # Each code offer links with data-shop-alias="cozyearth.com" and wraps a masked data-code="••••••OZY".
+    aliases = {storeDomain} | set(slugs(query))
 
-    storeQueries = query["query"]
+    def hasCodes(html):
+        offers = re.findall(
+            r'data-shop-alias="([^"]+)"[^>]*>\s*<div class="offer-list-item-button_hidden-code"[^>]*data-code="[^"]+"', html
+        )
+        return any(alias in aliases for alias in offers)
 
-    if storeDomain not in extHandles:
-        extHandles[storeDomain] = {}
-    if not hasAlready:
-        extHandles[storeDomain][extDomain] = []
-        isFound = False
-
-        url = f"https://www.discountreactor.com/api/search/results"
-
-        for i, search in enumerate(storeQueries):
-            try:
-                response, status = postZenrowsResponse(
-                    url,
-                    data=f"term={search}",
-                    headers={
-                        "Content-Type": "application/x-www-form-urlencoded",
-                        "Referer": "https://www.discountreactor.com",
-                    },
-                )
-                if not response:
-                    continue
-
-                jsondata = json.loads(response) if response else {}
-
-                if "data" in jsondata:
-                    for item in jsondata["data"]:
-                        if storeDomain in item["domain"]:
-                            handle = item["url"]
-                            extHandles[storeDomain][extDomain].append(handle)
-                            isFound = True
-                            break
-
-                if isFound:
-                    break
-
-            except Exception as e:
-                logger.error(f"** discountreactor** Error  fetching {url}: {e}")
-                continue
-
-    return extHandles
+    return check_site(
+        handles, storeDomain, query, "DiscountReactor", "discountreactor",
+        lambda name: [
+            f"https://www.discountreactor.com/coupons/{storeDomain}",
+            f"https://www.discountreactor.com/coupons/{name.replace('-', '')}",
+        ],
+        hasCodes,
+    )
 
 
 def couponbox(handles, storeDomain, query):
-    extDomain = "couponbox"
-    extHandles = handles.copy()
-    hasAlready = isExists(extDomain, storeDomain, handles)
+    # The store's own offers sit between "activeVouchersGrouped" and "expiredVouchers" in the Next.js payload;
+    # code offers there have \"codeType\":\"copy_paste\". Offers further down belong to other (cross-sell) stores.
+    def hasCodes(html):
+        start = html.find("activeVouchersGrouped")
+        end = html.find("expiredVouchers", start)
+        return start >= 0 and end > start and "copy_paste" in html[start:end]
 
-    storeQueries = query["query"]
-    storeHandle = query["handle"]
-
-    if storeDomain not in extHandles:
-        extHandles[storeDomain] = {}
-    if not hasAlready:
-        extHandles[storeDomain][extDomain] = []
-
-        isFound = False
-        for i, search in enumerate(storeQueries):
-            url = f"https://www.couponbox.com/api/search?query={search}&page=1&shopLimit=5"
-
-            try:
-                response, status = getZenrowsTwoResponse(url)
-                if not response:
-                    continue
-
-                jsondata = json.loads(response) if response else {}
-
-                if "shops" in jsondata:
-                    for item in jsondata["shops"]:
-                        refineHandle1 = item["name"].replace(" ", "").lower()
-                        refineHandle2 = item["resource"].replace("-", "").lower()
-                        if storeHandle in refineHandle1 or storeHandle in refineHandle2:
-                            handle = f'https://www.couponbox.com{item["resource"]}'
-                            extHandles[storeDomain][extDomain].append(handle)
-                            isFound = True
-                            break
-
-                if isFound:
-                    break
-
-            except Exception as e:
-                logger.error(f"Error  fetching {url}: {e}")
-                continue
-
-    return extHandles
+    return check_site(
+        handles, storeDomain, query, "Couponbox", "couponbox",
+        lambda name: f"https://www.couponbox.com/coupons/{name}",
+        hasCodes,
+    )
 
 
 def dealdrop(handles, storeDomain, query):
-    extDomain = "dealdrop"
-    extHandles = handles.copy()
-    hasAlready = isExists(extDomain, storeDomain, handles)
-
-    storeHandle = query["handle"]
-    storeQueries = query["query"]
-
-    if storeDomain not in extHandles:
-        extHandles[storeDomain] = {}
-    if not hasAlready:
-        extHandles[storeDomain][extDomain] = []
-
-        isFound = False
-        url = f"https://www.dealdrop.com/api/deals"
-
-        for i, search in enumerate(storeQueries):
-            try:
-                response, status = postZenrowsResponse(
-                    url,
-                    data=json.dumps({"domain": storeDomain}),
-                    headers={
-                        "Content-Type": "application/json",
-                        "Referer": "https://www.dealdrop.com",
-                    },
-                )
-
-                if not response:
-                    continue
-
-                jsondata = json.loads(response) if response else {}
-
-                if "merchant" in jsondata:
-                    for item in jsondata["merchant"]:
-                        logger.info(item)
-                        if storeDomain in item["domain"]:
-                            handle = f'https://www.dealdrop.com/{item["slug"]}'
-                            extHandles[storeDomain][extDomain].append(handle)
-                            isFound = True
-                            break
-
-                if isFound:
-                    break
-
-            except Exception as e:
-                logger.error(f"*** dealdrop *** Error  fetching {url}: {e}")
-                continue
-
-    return extHandles
+    # Each code is an <article id="code-<uuid>"> with a "Show code" button that shows the last characters
+    codePattern = re.compile(r'<article id="code-[^"]+"(?:(?!</article>).)*Show code', re.S)
+    return check_site(
+        handles, storeDomain, query, "DealDrop", "dealdrop",
+        lambda name: f"https://www.dealdrop.com/{name}",
+        lambda html: bool(codePattern.search(html)),
+    )
 
 
 def revounts(handles, storeDomain, query):
@@ -1620,220 +592,56 @@ def revounts(handles, storeDomain, query):
 
 
 def dazzdeals(handles, storeDomain, query):
-    extDomain = "dazzdeals"
-    extHandles = handles.copy()
-    hasAlready = isExists(extDomain, storeDomain, handles)
-
-    storeQueries = query["query"]
-    storeHandle = query["handle"]
-
-    if storeDomain not in extHandles:
-        extHandles[storeDomain] = {}
-    if not hasAlready:
-        extHandles[storeDomain][extDomain] = []
-        isFound = False
-        url = f"https://www.dazzdeals.com/searchsuggest/"
-        for i, search in enumerate(storeQueries):
-            try:
-                response, status = postZenrowsResponse(
-                    url,
-                    data=f"q={search}",
-                    headers={
-                        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8"
-                    },
-                )
-                if not response:
-                    continue
-
-                jsondata = json.loads(response) if response else {}
-
-                if "data" in jsondata:
-                    data = jsondata["data"]
-                    if "store" in data:
-                        for item in data["store"]:
-                            if item["catetype"] == "store":
-                                refineHandle1 = item["slug"].replace("-", "").lower()
-                                refineHandle2 = item["title"].replace(" ", "").lower()
-                                if (
-                                    storeHandle in refineHandle1
-                                    or storeHandle in refineHandle2
-                                ):
-                                    handle = f'https://www.dazzdeals.com/store/{item["slug"]}'
-                                    extHandles[storeDomain][extDomain].append(handle)
-                                    isFound = True
-                                    break
-
-                if isFound:
-                    break
-            except Exception as e:
-                logger.error(f"*** dazzdeals *** Error  fetching {url}: {e}")
-                continue
-
-    return extHandles
+    # Code offers have a hidden <a class="couponBtn hidden showCouponCode showcode">PNIK</a> holding the code's tail
+    return check_site(
+        handles, storeDomain, query, "DazzDeals", "dazzdeals",
+        lambda name: f"https://www.dazzdeals.com/store/{name}/",
+        lambda html: 'class="couponBtn hidden showCouponCode' in html,
+    )
 
 
 def greenpromocodes(handles, storeDomain, query):
-    extDomain = "greenpromocode"
-    extHandles = handles.copy()
+    # The site is greenpromocode.com (greenpromocodes.com does not resolve).
+    # Code offers have view-href="/coupons/cozy-earth/?view=11609534" followed by a "Show Code" button.
+    names = set(slugs(query))
 
-    if storeDomain not in extHandles:
-        extHandles[storeDomain] = {}
-    if extDomain not in extHandles[storeDomain]:
-        extHandles[storeDomain][extDomain] = []
+    def hasCodes(html):
+        offers = re.findall(r'view-href="/coupons/([^/]+)/\?view=\d+"[^>]*><div class="show_code">', html)
+        return any(slug in names for slug in offers)
 
-    all_names = [query["handle"]] + query["query"]
-
-    unique_names = list(dict.fromkeys(all_names))
-
-    for name in unique_names:
-        clean_name = name.replace(" ", "-").lower()
-        url = f"https://www.greenpromocode.com/coupons/{clean_name}/"
-        if url in extHandles[storeDomain][extDomain]:
-            logger.info(f"Already found in handles: {url}")
-            break
-
-        try:
-            logger.info(f"Checking GreenPromoCode: {url}")
-            response, status = postZenrowsResponse(url)
-
-            logger.info("status is", status)
-
-            if status == 200:
-                extHandles[storeDomain][extDomain].append(url)
-                logger.info(f"Success! Found on GreenPromoCode: {url}")
-                break
-            else:
-                logger.info(f"Not Found (Status {status}): {url}")
-
-        except Exception as e:
-            logger.error(f"Error fetching {url}: {e}")
-
-    return extHandles
+    return check_site(
+        handles, storeDomain, query, "GreenPromoCode", "greenpromocode",
+        lambda name: f"https://www.greenpromocode.com/coupons/{name}/",
+        hasCodes,
+    )
 
 
 def couponbind(handles, storeDomain, query):
-    extDomain = "couponbind"
-    extHandles = handles.copy()
-    hasAlready = isExists(extDomain, storeDomain, handles)
-
-    # storeHandle = query['handle']
-    # storeQueries = query['query']
-
-    if storeDomain not in extHandles:
-        extHandles[storeDomain] = {}
-    if not hasAlready:
-        extHandles[storeDomain][extDomain] = []
-
-        url = f"https://www.couponbind.com/suggest/"
-
-        try:
-            response, status = postZenrowsResponse(
-                url,
-                data=f"tp=se&kw={storeDomain}",
-                headers={
-                    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-                    "Referer": "https://www.couponbind.com",
-                },
-            )
-            if not response:
-                return extHandles
-
-            jsondata = json.loads(response) if response else []
-
-            for item in jsondata:
-                if storeDomain in item["Domain"]:
-                    if "UrlName" in item:
-                        handle = f'https://www.couponbind.com{item["UrlName"]}'
-                        extHandles[storeDomain][extDomain].append(handle)
-                        break
-
-        except Exception as e:
-            logger.error(f"Error  fetching {url}: {e}")
-
-    return extHandles
+    # Each code offer holds the full code in <span class="hiddenCode">CE-DISCOVERELLE</span>
+    return check_site(
+        handles, storeDomain, query, "CouponBind", "couponbind",
+        lambda name: f"https://www.couponbind.com/coupons/{storeDomain}",
+        lambda html: bool(re.search(r'<span class="hiddenCode">[^<]+</span>', html)),
+    )
 
 
 def deala(handles, storeDomain, query):
-    extDomain = "deala"
-    extHandles = handles.copy()
-
-    if storeDomain not in extHandles:
-        extHandles[storeDomain] = {}
-    if extDomain not in extHandles[storeDomain]:
-        extHandles[storeDomain][extDomain] = []
-
-    all_names = [query["handle"]] + query["query"]
-    unique_names = list(dict.fromkeys(all_names))
-
-    for name in unique_names:
-        clean_name = name.replace(" ", "-").lower()
-        url = f"https://www.deala.com/{clean_name}"
-
-        if url in extHandles[storeDomain][extDomain]:
-            logger.info(f"Already exists, skipping: {url}")
-            break
-
-        try:
-            logger.info(f"Checking Deala: {url}")
-
-            response, status = postZenrowsResponse(url)
-
-            if status == 200:
-
-                if (
-                    "Page Not Found" not in response
-                    and 'id="__next_error__"' not in response
-                ):
-                    extHandles[storeDomain][extDomain].append(url)
-                    logger.info(f"Success! Valid Deala Store Page: {url}")
-                    break
-                else:
-                    logger.info(f"Deala: 404/Invalid Page detected for {clean_name}")
-            else:
-                logger.info(f"Not found: {url} (Status: {status})")
-
-        except Exception as e:
-            logger.error(f"Error fetching Deala ({url}): {e}")
-
-    return extHandles
+    # The store's own offers are <app-card-coupon-without-store> cards; code offers have a "Get code" button
+    codePattern = re.compile(r"<app-card-coupon-without-store(?:(?!</app-card-coupon-without-store>).)*btn-get-code", re.S)
+    return check_site(
+        handles, storeDomain, query, "DealA", "deala",
+        lambda name: f"https://deala.com/{name}",
+        lambda html: bool(codePattern.search(html)),
+    )
 
 
 def promopro(handles, storeDomain, query):
-    logger.info("Starting promopro scrape...")
-    extDomain = "promopro"
-    extHandles = handles.copy()
-
-    if storeDomain not in extHandles:
-        extHandles[storeDomain] = {}
-    if extDomain not in extHandles[storeDomain]:
-        extHandles[storeDomain][extDomain] = []
-
-    queries = query["query"]
-    if isinstance(queries, str):
-        queries = [queries]
-
-    all_names = [query["handle"]] + queries
-    unique_names = list(dict.fromkeys(all_names))
-
-    for name in unique_names:
-        clean_name = name.replace(" ", "-").lower()
-        url = f"https://www.promopro.com/coupon-codes/{clean_name}"
-
-        if url in extHandles[storeDomain][extDomain]:
-            continue
-
-        try:
-            logger.info(f"Checking PromoPro: {url}")
-            response, status = postZenrowsResponse(url)
-
-            if status == 200 and 'id="__next_error__"' not in response:
-                extHandles[storeDomain][extDomain].append(url)
-                logger.info(f"Success! Valid Link Added: {url}")
-
-        except Exception as e:
-            logger.error(f"Error fetching PromoPro ({url}): {e}")
-
-    return extHandles
+    # Unknown stores return 410 Gone. Code offers are <article class="offer_card ... detail_filter_code">.
+    return check_site(
+        handles, storeDomain, query, "PromoPro", "promopro",
+        lambda name: f"https://www.promopro.com/coupon-codes/{name}",
+        lambda html: bool(re.search(r'<article class="offer_card[^"]*\bdetail_filter_code\b', html)),
+    )
 
 
 def couponbirds(handles, storeDomain, query):
@@ -1871,1161 +679,305 @@ def couponbirds(handles, storeDomain, query):
 
 
 def troupon(handles, storeDomain, query):
-    extDomain = "troupon"
-    extHandles = handles.copy()
-
-    if storeDomain not in extHandles:
-        extHandles[storeDomain] = {}
-    if extDomain not in extHandles[storeDomain]:
-        extHandles[storeDomain][extDomain] = []
-
-    all_names = [query["handle"]] + query["query"]
-
-    unique_names = list(dict.fromkeys(all_names))
-
-    for name in unique_names:
-        clean_name = name.replace(" ", "-").lower()
-        url = f"https://{clean_name}.troupon.com/"
-
-        if url in extHandles[storeDomain][extDomain]:
-            logger.info(f"Already found: {url}")
-            break
-
-        try:
-            logger.info(f"Checking Troupon: {url}")
-            response, status = getZenrowsTwoResponse(url, isProxy=True)
-
-            if status == 200:
-                extHandles[storeDomain][extDomain].append(url)
-                logger.info(f"Success! Found on Troupon: {url}")
-
-                break
-            else:
-                logger.info(f"Not Found: {url}")
-
-        except Exception as e:
-            logger.error(f"Error: {e}")
-
-    return extHandles
+    # Each store has its own subdomain. Codes look like data-coupon-code="HOMELIFE" data-coupon-url="https://cozyearth.com"
+    codePattern = re.compile(rf'data-coupon-code="[^"]+" data-coupon-url="https?://(www\.)?{re.escape(storeDomain)}')
+    return check_site(
+        handles, storeDomain, query, "Troupon", "troupon",
+        lambda name: f"https://{name}.troupon.com/",
+        lambda html: bool(codePattern.search(html)),
+    )
 
 
 def worthepenny(handles, storeDomain, query):
-    extDomain = "worthepenny"
-    extHandles = handles.copy()
+    # Each store has its own subdomain without hyphens (cozyearth.worthepenny.com).
+    # Code cards look like data-code="CE-CADE" ... data-coupon_type="code" data-name="Cozy Earth"; deals have data-code="".
+    names = {normalize(name) for name in slugs(query)}
 
-    if storeDomain not in extHandles:
-        extHandles[storeDomain] = {}
-    if extDomain not in extHandles[storeDomain]:
-        extHandles[storeDomain][extDomain] = []
+    def hasCodes(html):
+        offers = re.findall(r'data-code="[^"]+"[^>]*data-coupon_type="code"[^>]*data-name="([^"]+)"', html)
+        return any(normalize(unescape(name)) in names for name in offers)
 
-    all_names = [query["handle"]] + query["query"]
-
-    unique_names = list(dict.fromkeys(all_names))
-
-    for name in unique_names:
-
-        clean_name = name.replace(" ", "-").lower()
-        url = f"https://{clean_name}.worthepenny.com/coupon/"
-
-        if url in extHandles[storeDomain][extDomain]:
-            logger.info(f"Already exists, skipping search: {url}")
-            break
-
-        try:
-            logger.info(f"Checking Worthepenny: {url}")
-            response, status = getZenrowsTwoResponse(url, isProxy=True)
-
-            if status == 200:
-                verify_name = clean_name.replace("-", "")
-                if verify_name in response.lower().replace("-", ""):
-                    extHandles[storeDomain][extDomain].append(url)
-                    logger.info(f"Success! Found on Worthepenny: {url}")
-                    break
-                else:
-                    logger.info(f"Worthepenny: Name mismatch on page.")
-            else:
-                logger.info(f"Not found: {url} (Status: {status})")
-
-        except Exception as e:
-            logger.error(f"Error fetching Worthepenny ({url}): {e}")
-
-    return extHandles
+    return check_site(
+        handles, storeDomain, query, "WorthEPenny", "worthepenny",
+        lambda name: f"https://{name.replace('-', '')}.worthepenny.com/coupon/",
+        hasCodes,
+    )
 
 
 def savingheist(handles, storeDomain, query):
-    extDomain = "savingheist"
-    extHandles = handles.copy()
-
-    if storeDomain not in extHandles:
-        extHandles[storeDomain] = {}
-    if extDomain not in extHandles[storeDomain]:
-        extHandles[storeDomain][extDomain] = []
-
-    all_names = [query["handle"]] + query["query"]
-    unique_names = list(dict.fromkeys(all_names))
-
-    for name in unique_names:
-
-        clean_name = name.replace(" ", "-").lower()
-        url = f"https://www.savingheist.com/store/{clean_name}/"
-        if url in extHandles[storeDomain][extDomain]:
-            logger.info(f"Already exists, skipping: {url}")
-            break
-
-        try:
-            logger.info(f"Checking Savingheist: {url}")
-            response, status = getZenrowsTwoResponse(url, isProxy=True, isJsRender=True)
-
-            if status != 200:
-                logger.info(f"Not found: {url} (Status: {status})")
-                continue
-            if isinstance(response, dict) and "code" in response:
-                logger.info(f"SavingHeist: Page returned error code {response['code']}")
-                continue
-
-            extHandles[storeDomain][extDomain].append(url)
-            logger.info(f"Success! Found on SavingHeist: {url}")
-            break
-
-        except Exception as e:
-            logger.error(f"Error fetching Savingheist ({url}): {e}")
-
-    return extHandles
+    # Store pages are /store/{slug}/ or /store/{slug}-coupons/. Code buttons look like
+    # <button ... data-coupon-id="205324" data-code="BULKRATE">Get Code</button>
+    return check_site(
+        handles, storeDomain, query, "SavingHeist", "savingheist",
+        lambda name: [f"https://savingheist.com/store/{name}/", f"https://savingheist.com/store/{name}-coupons/"],
+        lambda html: bool(re.search(r'data-coupon-id="\d+" data-code="[^"]+"', html)),
+    )
 
 
 def coupongrouphy(handles, storeDomain, query):
-    extDomain = "coupongrouphy"
-    extHandles = handles.copy()
-    if storeDomain not in extHandles:
-        extHandles[storeDomain] = {}
-    if extDomain not in extHandles[storeDomain]:
-        extHandles[storeDomain][extDomain] = []
-
-    all_names = [query["handle"]] + query["query"]
-    unique_names = list(dict.fromkeys(all_names))
-
-    for name in unique_names:
-        clean_name = name.replace(" ", "-").lower()
-        url = f"https://coupongrouphy.com/dealstore/{clean_name}/"
-        if url in extHandles[storeDomain][extDomain]:
-            logger.info(f"Already exists, skipping search: {url}")
-            break
-
-        try:
-            logger.info(f"Checking Coupongrouphy: {url}")
-            response, status = getZenrowsTwoResponse(url, isProxy=True)
-
-            if status == 200:
-                match_name = clean_name.split("-")[0].split("_")[0]
-
-                if match_name in response.lower():
-                    extHandles[storeDomain][extDomain].append(url)
-                    logger.info(f"Success! Found on Coupongrouphy: {url}")
-                    break
-                else:
-                    logger.info(f"Coupongrouphy: Content mismatch for {clean_name}")
-            else:
-                logger.info(f"Not found: {url} (Status: {status})")
-
-        except Exception as e:
-            logger.error(f"Error fetching Coupongrouphy ({url}): {e}")
-
-    return extHandles
+    # WordPress (Rehub theme) store pages: /dealstore/{slug}/, and many slugs end in "thuy" (dreamlandbabycothuy).
+    # Code offers are <span class="... masked_coupon" data-clipboard-text="JULIANASPICOLUK0" ...>.
+    return check_site(
+        handles, storeDomain, query, "CouponGrouphy", "coupongrouphy",
+        lambda name: [f"https://coupongrouphy.com/dealstore/{name}/", f"https://coupongrouphy.com/dealstore/{name}thuy/"],
+        lambda html: bool(re.search(r'masked_coupon[^"]*" data-clipboard-text="[^"]+"', html)),
+    )
 
 
 def joincheckmate(handles, storeDomain, query):
-    extDomain = "joincheckmate"
-    extHandles = handles.copy()
-
-    if storeDomain not in extHandles:
-        extHandles[storeDomain] = {}
-    if extDomain not in extHandles[storeDomain]:
-        extHandles[storeDomain][extDomain] = []
-
-    all_names = [query["handle"]] + query["query"]
-    unique_names = list(dict.fromkeys(all_names))
-
-    if storeDomain.endswith(".co"):
-        tld = ".co"
-    else:
-        tld = ".com"
-
-    for name in unique_names:
-        clean_name = name.replace(" ", "-").lower()
-        if clean_name.endswith((".com", ".co")):
-            final_slug = clean_name
-        else:
-            final_slug = f"{clean_name}{tld}"
-
-        url = f"https://joincheckmate.com/merchants/{final_slug}"
-
-        if url in extHandles[storeDomain][extDomain]:
-            logger.info(f"Already exists, skipping search: {url}")
-            break
-
-        try:
-            logger.info(f"Checking JoinCheckmate: {url}")
-            response, status = getZenrowsTwoResponse(url, isProxy=True)
-
-            if status == 200:
-                match_name = final_slug.split(".")[0].split("-")[0]
-
-                if match_name in response.lower():
-                    extHandles[storeDomain][extDomain].append(url)
-                    logger.info(f"Success! Found on JoinCheckmate: {url}")
-                    break
-                else:
-                    logger.info(f"JoinCheckmate: Content mismatch for {final_slug}")
-            else:
-                logger.info(f"Not found: {url} (Status: {status})")
-
-        except Exception as e:
-            logger.error(f"Error fetching JoinCheckmate ({url}): {e}")
-
-    return extHandles
+    # Store pages use the domain. Codes are masked like <span class="label-regular tracking-widest ...">INS#############</span>
+    return check_site(
+        handles, storeDomain, query, "Checkmate", "joincheckmate",
+        lambda name: f"https://joincheckmate.com/merchants/{storeDomain}",
+        lambda html: bool(re.search(r'<span class="label-regular tracking-widest[^"]*">[^<#]*#+</span>', html)),
+    )
 
 
 def faircoupons(handles, storeDomain, query):
-    extDomain = "faircoupons"
-    extHandles = handles.copy()
-
-    if storeDomain not in extHandles:
-        extHandles[storeDomain] = {}
-    if extDomain not in extHandles[storeDomain]:
-        extHandles[storeDomain][extDomain] = []
-
-    all_names = [query["handle"]] + query["query"]
-    unique_names = list(dict.fromkeys(all_names))
-
-    for name in unique_names:
-
-        clean_name = name.replace(" ", "-").lower()
-        url = f"https://www.faircoupons.com/stores/{clean_name}"
-
-        if url in extHandles[storeDomain][extDomain]:
-            logger.info(f"Already exists, skipping: {url}")
-            break
-
-        try:
-            logger.info(f"Checking Faircoupons: {url}")
-            response, status = getZenrowsTwoResponse(url, isProxy=True)
-
-            if status == 200:
-                if 'id="__next_error__"' not in response:
-                    extHandles[storeDomain][extDomain].append(url)
-                    logger.info(f"Success! Valid Store Page: {url}")
-                    break
-                else:
-                    logger.info(
-                        f"Faircoupons: 404/Error Page detected for {clean_name}"
-                    )
-            else:
-                logger.info(f"Not found: {url} (Status: {status})")
-
-        except Exception as e:
-            logger.error(f"Error fetching Faircoupons ({url}): {e}")
-
-    return extHandles
+    return unsupported(handles, storeDomain, "faircoupons", "site is down: the server does not respond")
 
 # newer
 
 def gocashback(handles, storeDomain, query):
-    extDomain = "gocashback"
-    extHandles = handles.copy()
-
-    if storeDomain not in extHandles:
-        extHandles[storeDomain] = {}
-    if extDomain not in extHandles[storeDomain]:
-        extHandles[storeDomain][extDomain] = []
-
-    all_names = [query["handle"]] + query["query"]
-    unique_names = list(dict.fromkeys(all_names))
-
-    for name in unique_names:
-        clean_name = name.replace(" ", "-").lower()
-        for tld in (".com", ".co", ".net", ".org"):
-            if clean_name.endswith(tld):
-                clean_name = clean_name[: -len(tld)]
-                break
-
-        url = f"https://www.gocashback.com/store/{clean_name}"
-
-        if url in extHandles[storeDomain][extDomain]:
-            logger.info(f"Already exists, skipping: {url}")
-            break
-
-        try:
-            logger.info(f"Checking GoCashBack: {url}")
-            response, status = getZenrowsTwoResponse(url, isProxy=True)
-
-            if status == 200:
-                match_name = clean_name.replace("-", "")
-
-                if match_name in response.lower().replace("-", ""):
-                    extHandles[storeDomain][extDomain].append(url)
-                    logger.info(f"Success! Found on GoCashBack: {url}")
-                    break
-                else:
-                    logger.info(f"GoCashBack: Content mismatch for {clean_name}")
-            else:
-                logger.info(f"Not found: {url} (Status: {status})")
-
-        except Exception as e:
-            logger.error(f"Error fetching GoCashBack ({url}): {e}")
-
-    return extHandles
+    # Store pages are /stores/{slug} without hyphens. Coupons only appear after JS rendering, where each code
+    # sits under <span class="codetext">Code:</span>.
+    return check_site(
+        handles, storeDomain, query, "GoCashBack", "gocashback",
+        lambda name: f"https://www.gocashback.com/stores/{name.replace('-', '')}",
+        lambda html: 'class="codetext">Code:</span>' in html,
+        fetch=get_rendered,
+    )
 
 
 def trustdeals(handles, storeDomain, query):
-    extDomain = "trustdeals"
-    extHandles = handles.copy()
-
-    if storeDomain not in extHandles:
-        extHandles[storeDomain] = {}
-    if extDomain not in extHandles[storeDomain]:
-        extHandles[storeDomain][extDomain] = []
-
-    url = f"https://www.trustdeals.com/view/{storeDomain}"
-
-    try:
-        logger.info(f"Checking TrustDeals: {url}")
-        response, status = getZenrowsTwoResponse(url, isProxy=True)
-
-        if status == 200 and response:
-            soup = BeautifulSoup(response, "html.parser")
-            code_spans = soup.select("span.code")
-            if code_spans:
-                extHandles[storeDomain][extDomain].append(url)
-                logger.info(f"Success! Found on TrustDeals: {url}")
-            else:
-                logger.info(f"TrustDeals: No coupon codes found for {storeDomain}")
-        else:
-            logger.info(f"Not found: {url} (Status: {status})")
-
-    except Exception as e:
-        logger.error(f"Error fetching TrustDeals ({url}): {e}")
-
-    return extHandles
+    # Store pages use the domain. Code offers are <article class="coupon nw|common ..."> with <span class="code">.
+    # "coupon common" articles ("most common codewords at similar shops", e.g. SAVE10) count as codes,
+    # matching the live project; only "coupon expired" ones are skipped.
+    codePattern = re.compile(r'<article[^>]*class="coupon (?!expired)[^"]*"(?:(?!</article>).)*<span class="code">[^<]+</span>', re.S)
+    return check_site(
+        handles, storeDomain, query, "TrustDeals", "trustdeals",
+        lambda name: f"https://www.trustdeals.com/view/{storeDomain}",
+        lambda html: bool(codePattern.search(html)),
+    )
 
 
 def couponupto(handles, storeDomain, query):
-    extDomain = "couponupto"
-    extHandles = handles.copy()
+    # Unknown stores redirect to the homepage (which has its own codes), so require a /coupons/ canonical.
+    # Code offers show the full code as <p id="code-64ba23ddc05cf77fa779d770">SPECIALDEAL2023</p> <span>Show Code</span>
+    def hasCodes(html):
+        canonical = re.search(r'<link rel="canonical" href="([^"]+)"', html)
+        return (
+            bool(canonical) and "/coupons/" in canonical.group(1)
+            and bool(re.search(r'<p id="code-[0-9a-f]+">[^<]+</p>\s*<span>Show Code', html))
+        )
 
-    if storeDomain not in extHandles:
-        extHandles[storeDomain] = {}
-    if extDomain not in extHandles[storeDomain]:
-        extHandles[storeDomain][extDomain] = []
-
-    all_names = [query["handle"]] + query["query"]
-    unique_names = list(dict.fromkeys(all_names))
-
-    for name in unique_names:
-        clean_name = name.replace(" ", "-").lower()
-        for tld in (".com", ".co", ".net", ".org"):
-            if clean_name.endswith(tld):
-                clean_name = clean_name[: -len(tld)]
-                break
-
-        url = f"https://www.couponupto.com/coupons/{clean_name}"
-
-        if url in extHandles[storeDomain][extDomain]:
-            logger.info(f"Already exists, skipping: {url}")
-            break
-
-        try:
-            logger.info(f"Checking CouponUpto: {url}")
-            response, status = getZenrowsTwoResponse(url, isProxy=True)
-
-            if status == 200 and response:
-                soup = BeautifulSoup(response, "html.parser")
-                # Check for coupon code elements (a.a_code with p[id^='code-'])
-                code_tags = soup.select("a.a_code p[id^='code-']")
-                if code_tags:
-                    extHandles[storeDomain][extDomain].append(url)
-                    logger.info(f"Success! Found on CouponUpto: {url}")
-                    break
-                else:
-                    logger.info(f"CouponUpto: No coupon codes found for {clean_name}")
-            else:
-                logger.info(f"Not found: {url} (Status: {status})")
-
-        except Exception as e:
-            logger.error(f"Error fetching CouponUpto ({url}): {e}")
-
-    return extHandles
+    return check_site(
+        handles, storeDomain, query, "Couponupto", "couponupto",
+        lambda name: f"https://www.couponupto.com/coupons/{name}",
+        hasCodes,
+    )
 
 
 def promosreview(handles, storeDomain, query):
-    extDomain = "promosreview"
-    extHandles = handles.copy()
-
-    if storeDomain not in extHandles:
-        extHandles[storeDomain] = {}
-    if extDomain not in extHandles[storeDomain]:
-        extHandles[storeDomain][extDomain] = []
-
-    all_names = [query["handle"]] + query["query"]
-    unique_names = list(dict.fromkeys(all_names))
-
-    for name in unique_names:
-        clean_name = name.replace(" ", "")
-        for tld in (".com", ".co", ".net", ".org"):
-            if clean_name.lower().endswith(tld):
-                clean_name = clean_name[: -len(tld)]
-                break
-
-        variants = list(dict.fromkeys([
-            clean_name,
-            clean_name.capitalize(),
-            clean_name.upper(),
-            clean_name.lower(),
-        ]))
-
-        found = False
-        for variant in variants:
-            url = f"https://www.promosreview.com/store/{variant}-coupon-codes"
-
-            if url in extHandles[storeDomain][extDomain]:
-                logger.info(f"Already exists, skipping: {url}")
-                found = True
-                break
-
-            try:
-                logger.info(f"Checking PromosReview: {url}")
-                response, status = getZenrowsTwoResponse(url, isProxy=True)
-
-                if status == 200 and response:
-                    soup = BeautifulSoup(response, "html.parser")
-                    # Check for coupon code elements with data-code attribute
-                    code_elements = soup.select("[data-code]")
-                    if code_elements:
-                        extHandles[storeDomain][extDomain].append(url)
-                        logger.info(f"Success! Found on PromosReview: {url}")
-                        found = True
-                        break
-                    else:
-                        logger.info(f"PromosReview: No coupon codes found for {variant}")
-                else:
-                    logger.info(f"Not found: {url} (Status: {status})")
-
-            except Exception as e:
-                logger.error(f"Error fetching PromosReview ({url}): {e}")
-
-        if found:
-            break
-
-    return extHandles
+    # Store pages use the name without spaces in its original case: /store/CozyEarth-coupon-codes.
+    # Unknown stores get a small generic page. Codes look like data-code="PJ-BOGO" data-url="https://cozyearth.com".
+    names = list(dict.fromkeys(
+        "".join(word[:1].upper() + word[1:] for word in name.split())
+        for name in [query["handle"].replace("-", " ")] + query["query"]
+    ))
+    codePattern = re.compile(rf'data-code="[^"]+" data-url="https?://(www\.)?{re.escape(storeDomain)}')
+    return check_site(
+        handles, storeDomain, query, "PromosReview", "promosreview",
+        lambda name: [f"https://www.promosreview.com/store/{n}-coupon-codes" for n in names],
+        lambda html: bool(codePattern.search(html)),
+    )
 
 
 def couponsgo(handles, storeDomain, query):
-    extDomain = "couponsgo"
-    extHandles = handles.copy()
+    # The site is couponsgo.org (couponsgo.com and .net are parked). Store pages are /{slug} or /{domain};
+    # many stores have no page of their own but still show up in /search?query={name}.
+    # Offers are <div class="coupon-item ..." data-domain="shopbop.com">; code offers show the code's tail
+    # in <a class="get-deal-btn coupon_button"><p>CKUP</p>, deals say "Get Deal".
+    def hasCodes(html):
+        soup = BeautifulSoup(html, "html.parser")
+        for item in soup.select(f'.coupon-item[data-domain="{storeDomain}"]'):
+            button = item.select_one("a.coupon_button p")
+            if button and button.get_text(strip=True) and button.get_text(strip=True) != "Get Deal":
+                return True
+        return False
 
-    if storeDomain not in extHandles:
-        extHandles[storeDomain] = {}
-    if extDomain not in extHandles[storeDomain]:
-        extHandles[storeDomain][extDomain] = []
-
-    all_names = [query["handle"]] + query["query"]
-    unique_names = list(dict.fromkeys(all_names))
-
-    for name in unique_names:
-        clean_name = name.replace(" ", "-").lower()
-        for tld in (".com", ".co", ".net", ".org"):
-            if clean_name.endswith(tld):
-                clean_name = clean_name[: -len(tld)]
-                break
-
-        url = f"https://www.couponsgo.org/search?query={clean_name}"
-
-        if url in extHandles[storeDomain][extDomain]:
-            logger.info(f"Already exists, skipping: {url}")
-            break
-
-        try:
-            logger.info(f"Checking CouponsGo: {url}")
-            response, status = getZenrowsTwoResponse(url, isProxy=True)
-
-            if status == 200 and response:
-                soup = BeautifulSoup(response, "html.parser")
-                # Accept only pages that contain revealable coupon codes (not deal-only pages).
-                coupon_divs = soup.select("div.coupon-item.c-r-item.couponsgoorg")
-                show_code_links = soup.select('a[onclick*="click_show_code"]')
-
-                if coupon_divs and show_code_links:
-                    extHandles[storeDomain][extDomain].append(url)
-                    logger.info(f"Success! Found on CouponsGo: {url}")
-                    break
-                elif coupon_divs:
-                    logger.info(
-                        f"CouponsGo: Deal-only page (no show code) for {clean_name}"
-                    )
-                else:
-                    logger.info(f"CouponsGo: No coupons found for {clean_name}")
-            else:
-                logger.info(f"Not found: {url} (Status: {status})")
-
-        except Exception as e:
-            logger.error(f"Error fetching CouponsGo ({url}): {e}")
-
-    return extHandles
+    return check_site(
+        handles, storeDomain, query, "Couponsgo", "couponsgo",
+        lambda name: [
+            f"https://www.couponsgo.org/{name}",
+            f"https://www.couponsgo.org/{storeDomain}",
+            f"https://www.couponsgo.org/search?query={name.replace('-', '+')}",
+        ],
+        hasCodes,
+    )
 
 
 def getscoupon(handles, storeDomain, query):
-    extDomain = "getscoupon"
-    extHandles = handles.copy()
-
-    if storeDomain not in extHandles:
-        extHandles[storeDomain] = {}
-    if extDomain not in extHandles[storeDomain]:
-        extHandles[storeDomain][extDomain] = []
-
-    url = f"https://www.getscoupon.com/store/{storeDomain}"
-
-    try:
-        logger.info(f"Checking GetsCoupon: {url}")
-        response, status = getZenrowsTwoResponse(url, isProxy=True)
-
-        if status == 200 and response:
-            soup = BeautifulSoup(response, "html.parser")
-            # Check for coupon elements with data-code attribute
-            code_divs = soup.find_all("div", class_="getlistr")
-            has_codes = any(div.get("data-code") for div in code_divs)
-            if has_codes:
-                extHandles[storeDomain][extDomain].append(url)
-                logger.info(f"Success! Found on GetsCoupon: {url}")
-            else:
-                logger.info(f"GetsCoupon: No coupon codes found for {storeDomain}")
-        else:
-            logger.info(f"Not found: {url} (Status: {status})")
-
-    except Exception as e:
-        logger.error(f"Error fetching GetsCoupon ({url}): {e}")
-
-    return extHandles
+    # Same layout as PromosReview. Unknown stores get a small generic page.
+    # Codes look like data-code="PJ-BOGO" data-url="https://cozyearth.com".
+    codePattern = re.compile(rf'data-code="[^"]+" data-url="https?://(www\.)?{re.escape(storeDomain)}')
+    return check_site(
+        handles, storeDomain, query, "GetsCoupon", "getscoupon",
+        lambda name: f"https://www.getscoupon.com/store/{storeDomain}",
+        lambda html: bool(codePattern.search(html)),
+    )
 
 
 def rediscount(handles, storeDomain, query):
-    extDomain = "rediscount"
-    extHandles = handles.copy()
-
-    if storeDomain not in extHandles:
-        extHandles[storeDomain] = {}
-    if extDomain not in extHandles[storeDomain]:
-        extHandles[storeDomain][extDomain] = []
-
-    all_names = [query["handle"]] + query["query"]
-    unique_names = list(dict.fromkeys(all_names))
-
-    for name in unique_names:
-        clean_name = name.replace(" ", "-").lower()
-        for tld in (".com", ".co", ".net", ".org"):
-            if clean_name.endswith(tld):
-                clean_name = clean_name[: -len(tld)]
-                break
-
-        url = f"https://www.reediscount.com/{clean_name}/"
-
-        if url in extHandles[storeDomain][extDomain]:
-            logger.info(f"Already exists, skipping: {url}")
-            break
-
-        try:
-            logger.info(f"Checking ReeDiscount: {url}")
-            response, status = getZenrowsTwoResponse(url, isProxy=True)
-
-            if status == 200 and response:
-                soup = BeautifulSoup(response, "html.parser")
-                # Check for coupon code buttons with data-code attribute
-                buttons = soup.select(".coupons_buttons a.coupon_btn")
-                has_codes = any(btn.get("data-code") for btn in buttons)
-                if has_codes:
-                    extHandles[storeDomain][extDomain].append(url)
-                    logger.info(f"Success! Found on ReeDiscount: {url}")
-                    break
-                else:
-                    logger.info(f"ReeDiscount: No coupon codes found for {clean_name}")
-            else:
-                logger.info(f"Not found: {url} (Status: {status})")
-
-        except Exception as e:
-            logger.error(f"Error fetching ReeDiscount ({url}): {e}")
-
-    return extHandles
+    # rediscount.com is a parked domain; the real site is reediscount.com (double e).
+    # Store pages are /{slug}/ or /{domain}/. Code buttons look like <a rel="nofollow" data-code="NEW10" data-store_info="...">
+    return check_site(
+        handles, storeDomain, query, "ReeDiscount", "rediscount",
+        lambda name: [f"https://www.reediscount.com/{name}/", f"https://www.reediscount.com/{storeDomain}/"],
+        lambda html: bool(re.search(r'<a rel="nofollow" data-code="[^"]+" data-store_info=', html)),
+    )
 
 
 def couponterra(handles, storeDomain, query):
-    extDomain = "couponterra"
-    extHandles = handles.copy()
-
-    if storeDomain not in extHandles:
-        extHandles[storeDomain] = {}
-    if extDomain not in extHandles[storeDomain]:
-        extHandles[storeDomain][extDomain] = []
-
-    url = f"https://www.couponterra.com/coupons/{storeDomain}"
-
-    try:
-        logger.info(f"Checking CouponTerra: {url}")
-        response, status = getZenrowsTwoResponse(url, isProxy=True)
-
-        if status == 200 and response:
-            soup = BeautifulSoup(response, "html.parser")
-            # Check for coupon elements with data-code attribute
-            code_elements = soup.select("[data-code]")
-            has_codes = any(el.get("data-code") for el in code_elements)
-            if has_codes:
-                extHandles[storeDomain][extDomain].append(url)
-                logger.info(f"Success! Found on CouponTerra: {url}")
-            else:
-                logger.info(f"CouponTerra: No coupon codes found for {storeDomain}")
-        else:
-            logger.info(f"Not found: {url} (Status: {status})")
-
-    except Exception as e:
-        logger.error(f"Error fetching CouponTerra ({url}): {e}")
-
-    return extHandles
+    # Mostly prop trading firms, but some retail stores too (cabelas.com). Store pages use the domain.
+    # Unknown stores always come back as 422, so fetch once instead of going through the retries.
+    # Codes are in full: <div class="get-code getCodeBtn" data-coupon-id="1235" data-code="VORTEX15" ...>
+    return check_site(
+        handles, storeDomain, query, "CouponTerra", "couponterra",
+        lambda name: f"https://www.couponterra.com/coupons/{storeDomain}",
+        lambda html: bool(re.search(r'data-coupon-id="\d+"\s+data-code="[^"]+"', html)),
+        fetch=fetch_once,
+    )
 
 
 def couponkiss(handles, storeDomain, query):
-    extDomain = "couponkiss"
-    extHandles = handles.copy()
+    # The site is couponskiss.com (couponkiss.com is a domain for sale). Each store has its own subdomain,
+    # e.g. gform.couponskiss.com; unknown stores show the homepage (canonical www.couponskiss.com).
+    # Codes are in data-clipboard-text="WELCOMEBACK"; deals say "Click to Redeem".
+    def hasCodes(html):
+        canonical = re.search(r'<link rel="canonical" href="([^"]+)"', html)
+        if not canonical or "www.couponskiss.com" in canonical.group(1):
+            return False
+        codes = re.findall(r'data-clipboard-text="([^"]+)"', html)
+        return any(code != "Click to Redeem" for code in codes)
 
-    if storeDomain not in extHandles:
-        extHandles[storeDomain] = {}
-    if extDomain not in extHandles[storeDomain]:
-        extHandles[storeDomain][extDomain] = []
-
-    all_names = [query["handle"]] + query["query"]
-    unique_names = list(dict.fromkeys(all_names))
-
-    for name in unique_names:
-        clean_name = name.replace(" ", "").lower()
-        for tld in (".com", ".co", ".net", ".org", ".co.uk"):
-            if clean_name.endswith(tld):
-                clean_name = clean_name[: -len(tld)]
-                break
-
-        url = f"https://{clean_name}.couponskiss.com"
-
-        if url in extHandles[storeDomain][extDomain]:
-            logger.info(f"Already exists, skipping: {url}")
-            break
-
-        try:
-            logger.info(f"Checking CouponKiss: {url}")
-            response, status = getZenrowsTwoResponse(url, isProxy=True)
-
-            if status == 200 and response:
-                soup = BeautifulSoup(response, "html.parser")
-                # Only accept pages that have a revealable "Show Coupon Code" button.
-                show_code_spans = [
-                    el for el in soup.find_all("span")
-                    if el.get_text(strip=True).lower() == "show coupon code"
-                ]
-                if show_code_spans:
-                    extHandles[storeDomain][extDomain].append(url)
-                    logger.info(f"Success! Found on CouponKiss: {url}")
-                    break
-                else:
-                    logger.info(f"CouponKiss: No revealable coupon codes for {clean_name}")
-            else:
-                logger.info(f"Not found: {url} (Status: {status})")
-
-        except Exception as e:
-            logger.error(f"Error fetching CouponKiss ({url}): {e}")
-
-    return extHandles
+    return check_site(
+        handles, storeDomain, query, "CouponsKiss", "couponkiss",
+        lambda name: f"https://{name}.couponskiss.com/",
+        hasCodes,
+    )
 
 
 def shipthedeal(handles, storeDomain, query):
-    extDomain = "shipthedeal"
-    extHandles = handles.copy()
+    # The page header states the count: <span class="... font-bold">3</span> Coupon Code(s)
+    def hasCodes(html):
+        match = re.search(r'font-bold">(\d+)</span>\s*Coupon Code\(s\)', html)
+        return bool(match) and int(match.group(1)) > 0
 
-    if storeDomain not in extHandles:
-        extHandles[storeDomain] = {}
-    if extDomain not in extHandles[storeDomain]:
-        extHandles[storeDomain][extDomain] = []
-
-    all_names = [query["handle"]] + query["query"]
-    unique_names = list(dict.fromkeys(all_names))
-
-    for name in unique_names:
-        clean_name = name.replace(" ", "-").lower()
-        for tld in (".com", ".co", ".net", ".org", ".co.uk"):
-            if clean_name.endswith(tld):
-                clean_name = clean_name[: -len(tld)]
-                break
-
-        url = f"https://shipthedeal.com/store/{clean_name}-coupon"
-
-        if url in extHandles[storeDomain][extDomain]:
-            logger.info(f"Already exists, skipping: {url}")
-            break
-
-        try:
-            logger.info(f"Checking ShipTheDeal: {url}")
-            response, status = getZenrowsTwoResponse(url, isProxy=True)
-
-            if status == 200 and response:
-                soup = BeautifulSoup(response, "html.parser")
-                # Only accept pages that expose an explicit Show coupon code trigger.
-                show_code_elements = [
-                    el
-                    for el in soup.find_all(["div", "span", "a", "button"])
-                    if el.get_text(strip=True).lower() == "show coupon code"
-                ]
-
-                if show_code_elements:
-                    extHandles[storeDomain][extDomain].append(url)
-                    logger.info(f"Success! Found on ShipTheDeal: {url}")
-                    break
-                else:
-                    logger.info(
-                        f"ShipTheDeal: No revealable coupon codes for {clean_name}"
-                    )
-            else:
-                logger.info(f"Not found: {url} (Status: {status})")
-
-        except Exception as e:
-            logger.error(f"Error fetching ShipTheDeal ({url}): {e}")
-
-    return extHandles
+    return check_site(
+        handles, storeDomain, query, "ShipTheDeal", "shipthedeal",
+        lambda name: f"https://shipthedeal.com/store/{name}-coupon",
+        hasCodes,
+    )
 
 
 def couponpromo(handles, storeDomain, query):
-    extDomain = "couponpromo"
-    extHandles = handles.copy()
-
-    if storeDomain not in extHandles:
-        extHandles[storeDomain] = {}
-    if extDomain not in extHandles[storeDomain]:
-        extHandles[storeDomain][extDomain] = []
-
-    all_names = [query["handle"]] + query["query"]
-    unique_names = list(dict.fromkeys(all_names))
-
-    for name in unique_names:
-        clean_name = name.replace(" ", "").lower()
-        for tld in (".com", ".co", ".net", ".org", ".co.uk"):
-            if clean_name.endswith(tld):
-                clean_name = clean_name[: -len(tld)]
-                break
-
-        url = f"https://couponpromo.net/search?query={clean_name}"
-
-        if url in extHandles[storeDomain][extDomain]:
-            logger.info(f"Already exists, skipping: {url}")
-            break
-
-        try:
-            logger.info(f"Checking CouponPromo: {url}")
-            response, status = getZenrowsTwoResponse(url, isProxy=True)
-
-            if status == 200 and response:
-                soup = BeautifulSoup(response, "html.parser")
-                # Only accept pages that have a revealable "Reveal Code" trigger.
-                reveal_code_elements = [
-                    el
-                    for el in soup.find_all(["div", "span", "a", "button"])
-                    if el.get_text(strip=True).lower() == "reveal code"
-                ]
-
-                if reveal_code_elements:
-                    extHandles[storeDomain][extDomain].append(url)
-                    logger.info(f"Success! Found on CouponPromo: {url}")
-                    break
-                else:
-                    logger.info(f"CouponPromo: No revealable coupon codes for {clean_name}")
-            else:
-                logger.info(f"Not found: {url} (Status: {status})")
-
-        except Exception as e:
-            logger.error(f"Error fetching CouponPromo ({url}): {e}")
-
-    return extHandles
+    # The site is couponpromo.net (couponpromo.com is for sale). Store page URLs are irregular
+    # (/target/target-promo-code.htm), so the site search is used: /search?query={name}.
+    # Results carry the full code and the store: data-domain="nobullproject.com" ... data-clipboard-text="GOVX20"
+    codePattern = re.compile(rf'data-domain="{re.escape(storeDomain)}"[\s\S]*?data-clipboard-text="[^"]+"')
+    names = list(dict.fromkeys(name.replace("-", " ") for name in slugs(query)))
+    return check_site(
+        handles, storeDomain, query, "CouponPromo", "couponpromo",
+        lambda name: [f"https://couponpromo.net/search?query={n.replace(' ', '+')}" for n in names],
+        lambda html: bool(codePattern.search(html)),
+    )
 
 
 def couponblender(handles, storeDomain, query):
-    extDomain = "couponblender"
-    extHandles = handles.copy()
+    # Unknown stores show the homepage (canonical "https://www.couponblender.com//"), so require a store canonical.
+    # Each offer is labelled <div class="type">COUPON CODE</div> or <div class="type">DEAL</div>.
+    def hasCodes(html):
+        canonical = re.search(r'<link rel="canonical" href="([^"]+)"', html)
+        return (
+            bool(canonical) and not canonical.group(1).rstrip("/").endswith("couponblender")
+            and '<div class="type">COUPON CODE</div>' in html
+        )
 
-    if storeDomain not in extHandles:
-        extHandles[storeDomain] = {}
-    if extDomain not in extHandles[storeDomain]:
-        extHandles[storeDomain][extDomain] = []
-
-    all_names = [query["handle"]] + query["query"]
-    unique_names = list(dict.fromkeys(all_names))
-
-    for name in unique_names:
-        clean_name = name.replace(" ", "-").lower()
-        for tld in (".com", ".co", ".net", ".org", ".co.uk"):
-            if clean_name.endswith(tld):
-                clean_name = clean_name[: -len(tld)]
-                break
-
-        url = f"https://www.couponblender.com/{clean_name}/"
-
-        if url in extHandles[storeDomain][extDomain]:
-            logger.info(f"Already exists, skipping: {url}")
-            break
-
-        try:
-            logger.info(f"Checking CouponBlender: {url}")
-            response, status = getZenrowsTwoResponse(url, isProxy=True)
-
-            if status == 200 and response:
-                soup = BeautifulSoup(response, "html.parser")
-                # Only accept pages that expose an explicit Show Coupon Code trigger.
-                show_code_elements = [
-                    el
-                    for el in soup.find_all(["div", "span", "a", "button"])
-                    if el.get_text(strip=True).lower() == "show coupon code"
-                ]
-
-                if show_code_elements:
-                    extHandles[storeDomain][extDomain].append(url)
-                    logger.info(f"Success! Found on CouponBlender: {url}")
-                    break
-                else:
-                    logger.info(
-                        f"CouponBlender: No revealable coupon codes for {clean_name}"
-                    )
-            else:
-                logger.info(f"Not found: {url} (Status: {status})")
-
-        except Exception as e:
-            logger.error(f"Error fetching CouponBlender ({url}): {e}")
-
-    return extHandles
+    return check_site(
+        handles, storeDomain, query, "Coupon Blender", "couponblender",
+        lambda name: f"https://www.couponblender.com/{name}/",
+        hasCodes,
+    )
 
 
 def xyzcodes(handles, storeDomain, query):
-    extDomain = "xyzcodes"
-    extHandles = handles.copy()
-
-    if storeDomain not in extHandles:
-        extHandles[storeDomain] = {}
-    if extDomain not in extHandles[storeDomain]:
-        extHandles[storeDomain][extDomain] = []
-
-    all_names = [query["handle"]] + query["query"]
-    unique_names = list(dict.fromkeys(all_names))
-
-    for name in unique_names:
-        clean_name = name.replace(" ", "-").lower()
-        for tld in (".com", ".co", ".net", ".org", ".co.uk"):
-            if clean_name.endswith(tld):
-                clean_name = clean_name[: -len(tld)]
-                break
-
-        url = f"https://xyzcodes.com/store/{clean_name}/"
-
-        if url in extHandles[storeDomain][extDomain]:
-            logger.info(f"Already exists, skipping: {url}")
-            break
-
-        try:
-            logger.info(f"Checking XYZCodes: {url}")
-            response, status = getZenrowsTwoResponse(url, isProxy=True)
-
-            if status == 200 and response:
-                soup = BeautifulSoup(response, "html.parser")
-                # Only accept pages that have an explicit "Show Code" span element.
-                show_code_spans = [
-                    el
-                    for el in soup.find_all("span")
-                    if el.get_text(strip=True).lower() == "show code"
-                ]
-
-                if show_code_spans:
-                    extHandles[storeDomain][extDomain].append(url)
-                    logger.info(f"Success! Found on XYZCodes: {url}")
-                    break
-                else:
-                    logger.info(f"XYZCodes: No revealable coupon codes for {clean_name}")
-            else:
-                logger.info(f"Not found: {url} (Status: {status})")
-
-        except Exception as e:
-            logger.error(f"Error fetching XYZCodes ({url}): {e}")
-
-    return extHandles
+    # WordPress "WP Coupons and Deals" plugin; pages often need the JS-challenge retry.
+    # Code offers are <a data-type="code" data-coupon-id="3474" ...>; deals use data-type="deal".
+    return check_site(
+        handles, storeDomain, query, "XYZCodes", "xyzcodes",
+        lambda name: [f"https://www.xyzcodes.com/store/{name}/", f"https://www.xyzcodes.com/store/{storeDomain.replace('.', '-')}/"],
+        lambda html: bool(re.search(r'<a data-type="code" data-coupon-id="\d+"', html)),
+    )
 
 
 def kotag(handles, storeDomain, query):
-    extDomain = "kotag"
-    extHandles = handles.copy()
+    # The site is kotag.co (kotag.com is a domain for sale): influencer promo codes.
+    # Unknown stores show the brand list. The store's codes are in the Next.js data at
+    # props.pageProps.coupons = [{"code": "CHAMPAGNE45", "expired": false, ...}]
+    def hasCodes(html):
+        match = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.S)
+        if not match:
+            return False
+        coupons = json.loads(match.group(1)).get("props", {}).get("pageProps", {}).get("coupons") or []
+        return any(coupon.get("code") and not coupon.get("expired") for coupon in coupons if isinstance(coupon, dict))
 
-    if storeDomain not in extHandles:
-        extHandles[storeDomain] = {}
-    if extDomain not in extHandles[storeDomain]:
-        extHandles[storeDomain][extDomain] = []
-
-    all_names = [query["handle"]] + query["query"]
-    unique_names = list(dict.fromkeys(all_names))
-
-    for name in unique_names:
-        clean_name = name.replace(" ", "-").lower()
-        for tld in (".com", ".co", ".net", ".org", ".co.uk"):
-            if clean_name.endswith(tld):
-                clean_name = clean_name[: -len(tld)]
-                break
-
-        url = f"https://kotag.co/us/marques/codes-promo-{clean_name}/"
-
-        if url in extHandles[storeDomain][extDomain]:
-            logger.info(f"Already exists, skipping: {url}")
-            break
-
-        try:
-            logger.info(f"Checking Kotag: {url}")
-            response, status = getZenrowsTwoResponse(url, isProxy=True)
-
-            if status == 200 and response:
-                soup = BeautifulSoup(response, "html.parser")
-                # Only accept pages that have an explicit "Show coupon code" button.
-                show_code_buttons = [
-                    el
-                    for el in soup.find_all("button")
-                    if el.get_text(strip=True).lower() == "show coupon code"
-                ]
-
-                if show_code_buttons:
-                    extHandles[storeDomain][extDomain].append(url)
-                    logger.info(f"Success! Found on Kotag: {url}")
-                    break
-                else:
-                    logger.info(f"Kotag: No revealable coupon codes for {clean_name}")
-            else:
-                logger.info(f"Not found: {url} (Status: {status})")
-
-        except Exception as e:
-            logger.error(f"Error fetching Kotag ({url}): {e}")
-
-    return extHandles
+    return check_site(
+        handles, storeDomain, query, "Kotag", "kotag",
+        lambda name: f"https://kotag.co/us/marques/codes-promo-{name}/",
+        hasCodes,
+    )
 
 
 def zensavings(handles, storeDomain, query):
-    extDomain = "zensavings"
-    extHandles = handles.copy()
-
-    if storeDomain not in extHandles:
-        extHandles[storeDomain] = {}
-    if extDomain not in extHandles[storeDomain]:
-        extHandles[storeDomain][extDomain] = []
-
-    all_names = [query["handle"]] + query["query"]
-    unique_names = list(dict.fromkeys(all_names))
-
-    for name in unique_names:
-        clean_name = name.replace(" ", "-").lower()
-        for tld in (".com", ".co", ".net", ".org", ".co.uk"):
-            if clean_name.endswith(tld):
-                clean_name = clean_name[: -len(tld)]
-                break
-
-        url = f"https://zensaving.com/store/{clean_name}/"
-
-        if url in extHandles[storeDomain][extDomain]:
-            logger.info(f"Already exists, skipping: {url}")
-            break
-
-        try:
-            logger.info(f"Checking ZenSaving: {url}")
-            response, status = getZenrowsTwoResponse(
-                url, isProxy=True, isJsRender=True
-            )
-
-            if status == 200 and response:
-                soup = BeautifulSoup(response, "html.parser")
-                # Only accept pages that expose a real code trigger span.
-                get_code_spans = [
-                    el
-                    for el in soup.select("span.get-code")
-                    if " ".join(el.get_text(" ", strip=True).split()).lower()
-                    == "get code"
-                ]
-
-                if get_code_spans:
-                    extHandles[storeDomain][extDomain].append(url)
-                    logger.info(f"Success! Found on ZenSaving: {url}")
-                    break
-                else:
-                    logger.info(f"ZenSaving: No revealable coupon codes for {clean_name}")
-            else:
-                logger.info(f"Not found: {url} (Status: {status})")
-
-        except Exception as e:
-            logger.error(f"Error fetching ZenSaving ({url}): {e}")
-
-    return extHandles
+    # The site is zensaving.com (zensavings.com is parked). Store pages are /store/{slug}, but every
+    # store checked (16) lists only deals, no codes.
+    return unsupported(handles, storeDomain, "zensavings", "store pages list only deals, no coupon codes")
 
 
 def coponcodes(handles, storeDomain, query):
-    extDomain = "coponcodes"
-    extHandles = handles.copy()
-
-    if storeDomain not in extHandles:
-        extHandles[storeDomain] = {}
-    if extDomain not in extHandles[storeDomain]:
-        extHandles[storeDomain][extDomain] = []
-
-    all_names = [query["handle"]] + query["query"]
-    unique_names = list(dict.fromkeys(all_names))
-
-    suffixes = ["-coupon-code", "-promo-codes", "-coupon-codes", "-coupons", "-voucher-codes"]
-
-    for name in unique_names:
-        clean_name = str(name).strip().replace(" ", "-").lower()
-        for tld in (".com", ".co", ".net", ".org", ".co.uk"):
-            if clean_name.endswith(tld):
-                clean_name = clean_name[: -len(tld)]
-                break
-
-        # Guard against noisy/invalid search terms that can lead to generic pages.
-        clean_name = clean_name.strip("-/")
-        if len(clean_name) < 3:
-            continue
-
-        for suffix in suffixes:
-            url = f"https://coponcodes.com/store/{clean_name}{suffix}/"
-
-            if url in extHandles[storeDomain][extDomain]:
-                logger.info(f"Already exists, skipping: {url}")
-                return extHandles
-
-            try:
-                logger.info(f"Checking CoponCodes: {url}")
-                response, status = getZenrowsTwoResponse(
-                    url, isProxy=True, isJsRender=True
-                )
-
-                if status == 200 and response:
-                    soup = BeautifulSoup(response, "html.parser")
-
-                    # Accept only pages that expose real coupon-code triggers.
-                    has_get_code = any(
-                        el.get_text(strip=True) == "Get Code"
-                        for el in soup.find_all("span")
-                    )
-
-                    # Prevent unrelated store pages by requiring current store slug marker.
-                    response_lower = response.lower()
-                    has_store_marker = (
-                        f"/store/{clean_name}" in response_lower
-                        or clean_name in response_lower
-                    )
-
-                    if has_get_code and has_store_marker:
-                        extHandles[storeDomain][extDomain].append(url)
-                        logger.info(f"Success! Found on CoponCodes: {url}")
-                        return extHandles
-
-                    logger.info(
-                        f"CoponCodes: Skip mismatch/deal-only page for {clean_name}"
-                    )
-                else:
-                    logger.info(f"Not found: {url} (Status: {status})")
-
-            except Exception as e:
-                logger.error(f"Error fetching CoponCodes ({url}): {e}")
-
-    return extHandles
+    # Store slugs vary (aosom-uk, bioptimizers-com, avidlove-promo-codes), so a few forms are tried.
+    # Unknown stores take about 30s and return 422, so each URL is fetched once without retries.
+    # Each code is hidden in <span id="code-2505" hidden>BFCM2025</span>
+    return check_site(
+        handles, storeDomain, query, "Coponcodes", "coponcodes",
+        lambda name: [
+            f"https://coponcodes.com/store/{name}/",
+            f"https://coponcodes.com/store/{storeDomain.replace('.', '-')}/",
+            f"https://coponcodes.com/store/{name}-promo-codes/",
+            f"https://coponcodes.com/store/{name}-coupon-code/",
+        ],
+        lambda html: bool(re.search(r'<span id="code-\d+" hidden>[^<]+</span>', html)),
+        fetch=fetch_once,
+    )
 
 
 def dealam(handles, storeDomain, query):
-    extDomain = "dealam"
-    extHandles = handles.copy()
-
-    if storeDomain not in extHandles:
-        extHandles[storeDomain] = {}
-    if extDomain not in extHandles[storeDomain]:
-        extHandles[storeDomain][extDomain] = []
-
-    all_names = [query["handle"]] + query["query"]
-    unique_names = list(dict.fromkeys(all_names))
-
-    for name in unique_names:
-        clean_name = name.replace(" ", "-").lower()
-        for tld in (".com","co.uk"):
-            if clean_name.endswith(tld):
-                clean_name = clean_name[: -len(tld)]
-                break
-
-        url = f"https://www.dealam.com/stores/{clean_name}.html"
-
-        if url in extHandles[storeDomain][extDomain]:
-            logger.info(f"Already exists, skipping: {url}")
-            break
-
-        try:
-            logger.info(f"Checking DealAM: {url}")
-            response, status = getZenrowsTwoResponse(url, isProxy=True)
-
-            if status == 200 and response:
-                extHandles[storeDomain][extDomain].append(url)
-                logger.info(f"Success! Found on DealAM: {url}")
-                break
-            else:
-                logger.info(f"Not found: {url} (Status: {status})")
-
-        except Exception as e:
-            logger.error(f"Error fetching DealAM ({url}): {e}")
-
-    return extHandles
+    # Code offers are <div class="dx_code_coupons">; cards with "new-class-ads" are ads for other offers.
+    codePattern = re.compile(r'class="dx_code_coupons(?![^"]*new-class-ads)[^"]*"')
+    return check_site(
+        handles, storeDomain, query, "DealAM", "dealam",
+        lambda name: f"https://www.dealam.com/coupons/{name}/",
+        lambda html: bool(codePattern.search(html)),
+    )
 
 
 def latestdeals(handles, storeDomain, query):
-    extDomain = "latestdeals"
-    extHandles = handles.copy()
-
-    if storeDomain not in extHandles:
-        extHandles[storeDomain] = {}
-    if extDomain not in extHandles[storeDomain]:
-        extHandles[storeDomain][extDomain] = []
-
-    all_names = [query["handle"]] + query["query"]
-    unique_names = list(dict.fromkeys(all_names))
-
-    if storeDomain.endswith(".co"):
-        tld = ".co"
-    else:
-        tld = ".com"
-
-    for name in unique_names:
-        clean_name = name.replace(" ", "-").lower()
-        if clean_name.endswith((".com", ".co")):
-            final_slug = clean_name
-        else:
-            final_slug = f"{clean_name}{tld}"
-
-        url = f"https://www.latestdeals.co.uk/retailers/{final_slug}"
-
-        if url in extHandles[storeDomain][extDomain]:
-            logger.info(f"Already exists, skipping search: {url}")
-            break
-
-        try:
-            logger.info(f"Checking LatestDeals: {url}")
-            response, status = getZenrowsTwoResponse(url, isProxy=True)
-
-            if status == 200 and response:
-                match_name = final_slug.split(".")[0].split("-")[0]
-
-                if match_name in response.lower():
-                    extHandles[storeDomain][extDomain].append(url)
-                    logger.info(f"Success! Found on LatestDeals: {url}")
-                    break
-                else:
-                    logger.info(f"LatestDeals: Content mismatch for {final_slug}")
-            else:
-                logger.info(f"Not found: {url} (Status: {status})")
-
-        except Exception as e:
-            logger.error(f"Error fetching LatestDeals ({url}): {e}")
-
-    return extHandles
+    # UK site behind an AWS WAF challenge, so pages are always fetched with JS rendering.
+    # Active codes are "Get Code" buttons holding the code's tail: >Get Code<span data-code="24"; expired ones say "Check Code".
+    return check_site(
+        handles, storeDomain, query, "LatestDeals", "latestdeals",
+        lambda name: f"https://www.latestdeals.co.uk/retailers/{storeDomain}",
+        lambda html: bool(re.search(r'>Get Code<span data-code="[^"]+"', html)),
+        fetch=get_rendered,
+    )
