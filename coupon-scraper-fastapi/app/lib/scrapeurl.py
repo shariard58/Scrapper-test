@@ -1,7 +1,9 @@
 import json
 import re
 from html import unescape
+from urllib.parse import quote
 
+import requests
 from bs4 import BeautifulSoup
 
 from app.lib.helpers import (fetch_once, get_rendered, get_response,
@@ -73,7 +75,13 @@ def check_url(site_name, url, is_valid, recheck=False, fetch=get_response):
     if status != 200:
         logger.info(f"Not found: {url} (Status: {status})")
         return False
-    if not is_valid(response):
+    # A page whose layout changed (e.g. broken JSON) must not take down the other sites on the same page
+    try:
+        has_codes = is_valid(response)
+    except Exception as e:
+        logger.error(f"Error checking {site_name} ({url}): {e}")
+        return None
+    if not has_codes:
         logger.info(f"{site_name}: page exists but has no codes for this store: {url}")
         return False
     logger.info(f"Valid store page with codes: {url}")
@@ -980,4 +988,86 @@ def latestdeals(handles, storeDomain, query):
         lambda name: f"https://www.latestdeals.co.uk/retailers/{storeDomain}",
         lambda html: bool(re.search(r'>Get Code<span data-code="[^"]+"', html)),
         fetch=get_rendered,
+    )
+
+
+def redeempromos_search(storeDomain, query):
+    """Return store page URLs from redeempromos' site search whose name is exactly the store's name."""
+    # Store slugs are irregular (/ridge-coupon-code, /pelsbarn-coupn-code, /tsb-living), so the URL can't be guessed.
+    # Search only works with a single word: "tsb" finds "TSB Living", "tsb living" finds nothing.
+    # Results are cards in the "Matching Stores" section: <a href="https://redeempromos.com/tsb-living"><img alt="TSB Living">
+    def key(text):
+        return re.sub(r"[^a-z0-9]", "", text.lower())
+
+    def strip_tld(name):
+        name = name.strip().lower()
+        for tld in (".co.uk", ".com", ".co", ".net", ".org"):
+            if name.endswith(tld):
+                return name[: -len(tld)]
+        return name
+
+    names = [strip_tld(name) for name in [query["handle"]] + query["query"]]
+    keys = {key(name) for name in names + [strip_tld(storeDomain)] if len(key(name)) >= 2}
+    words = list(dict.fromkeys(name.replace("-", " ").split()[0] for name in names if name.split()))
+
+    urls = []
+    for word in words:
+        url = f"https://redeempromos.com/search/{quote(word)}"
+        try:
+            response, status = get_response(url)
+            if status != 200:
+                continue
+            soup = BeautifulSoup(response, "html.parser")
+            heading = soup.find(string=lambda text: text and "Matching Stores" in text)
+            section = heading.find_parent(class_="section") if heading else None
+            if not section:
+                continue
+            for card in section.find_all("a", href=True):
+                img = card.find("img")
+                store_name = img.get("alt", "") if img else card.get_text(" ", strip=True)
+                if key(store_name) in keys:
+                    urls.append(card["href"].split("?")[0])
+        except Exception as e:
+            logger.error(f"Error fetching {url}: {e}")
+    return list(dict.fromkeys(urls))
+
+
+def redeempromos(handles, storeDomain, query):
+    # The store page is found through the site search (see redeempromos_search).
+    # Code offers are <a class="btn-reveal-wrap" href=".../tsb-living?offer=22845"><span class="btn-label">Get Code</span>;
+    # deals say "Get Deal". The code itself comes from POST /welcome/getcode (cid=22845), and some "Get Code"
+    # offers only hold a placeholder like "OFFER ACTIVATED", so a page counts only if one offer returns a real code.
+    def has_codes(html):
+        soup = BeautifulSoup(html, "html.parser")
+        cids = []
+        for button in soup.select("a.btn-reveal-wrap[href]"):
+            label = button.select_one("span.btn-label")
+            match = re.search(r"[?&]offer=(\d+)", button["href"])
+            if label and label.get_text(strip=True).lower() == "get code" and match and match.group(1) not in cids:
+                cids.append(match.group(1))
+
+        for cid in cids:
+            try:
+                # The API isn't protected, so a plain request is enough (no ZenRows credits)
+                response = requests.post(
+                    "https://redeempromos.com/welcome/getcode",
+                    data={"cid": cid, "grabit": 0},
+                    headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"},
+                    timeout=20,
+                )
+                data = json.loads(response.text)
+            except Exception as e:
+                logger.error(f"Error fetching RedeemPromos code {cid}: {e}")
+                continue
+            # Unknown ids return 0 instead of a list
+            code = (data[0].get("code") or "").strip() if isinstance(data, list) and data else ""
+            if code and " " not in code:
+                return True
+        return False
+
+    store_urls = redeempromos_search(storeDomain, query)
+    return check_site(
+        handles, storeDomain, query, "RedeemPromos", "redeempromos",
+        lambda name: store_urls,
+        has_codes,
     )

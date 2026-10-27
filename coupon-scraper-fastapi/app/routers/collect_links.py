@@ -139,7 +139,8 @@ def get_scraper_groups(algolia_config: dict) -> dict:
         ],
         
         16:[
-            su.latestdeals
+            su.latestdeals,
+            su.redeempromos
         ]
          
     }
