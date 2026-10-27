@@ -1,0 +1,65 @@
+# Add directories or file patterns to ignore during indexing (e.g. foo/ or *.csv)
+
+# Dependencies
+node_modules/
+
+# Logs
+*.log
+logs/
+logger/
+
+# Environment files (sensitive data)
+.env
+.env.local
+.env.production
+.env.staging
+
+# Build outputs and cache
+dist/
+build/
+.cache/
+.tmp/
+
+# IDE/Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Git directory (usually not needed for AI context)
+.git/
+
+# Docker files (optional - uncomment if you don't want these in AI context)
+docker-compose*.yml
+Dockerfile*
+# .dockerignore
+
+# Large data files
+*.csv
+*.json.gz
+*.sql
+*.dump
+
+# Firebase credentials and other sensitive files
+*firebase*.json
+*.pem
+*.key
+*.crt
+
+# Package lock files (large and not useful for AI context)
+package-lock.json
+yarn.lock
+
+# Test coverage reports
+coverage/
+.nyc_output/
