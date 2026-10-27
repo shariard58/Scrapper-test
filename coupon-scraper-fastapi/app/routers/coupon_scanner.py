@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Query
+from fastapi.concurrency import run_in_threadpool
 from app.models import get_coupon_scanner_by_store, update_coupon_scanner_by_id
 from app.lib.response import (
     success_response,
@@ -43,7 +44,8 @@ async def fetch_and_process_coupons(store: str, website: str, coupon_scanner_inf
         # These are async functions - use await since we're in an async route handler
         coupons = await fetch_func(website_urls)
     else:
-        coupons = fetch_func(website_urls)
+        # Sync scrapers block, so run them in a worker thread to keep the server responsive
+        coupons = await run_in_threadpool(fetch_func, website_urls)
     
     # Remove duplicates
     coupons = list(set(coupons))
@@ -57,7 +59,7 @@ async def fetch_and_process_coupons(store: str, website: str, coupon_scanner_inf
         return True, success_response("No coupons found", []), []
     
     # Update coupon scanner
-    update_coupon_scanner_by_id(coupon_scanner_id, coupons)
+    await run_in_threadpool(update_coupon_scanner_by_id, coupon_scanner_id, coupons)
     
     # Return success response
     return True, success_response("Fetch coupons successfully", coupons), coupons
@@ -72,7 +74,7 @@ async def get_coupon_scanner(
     """
     try:
         # Get coupon scanner info
-        coupon_scanner_info = get_coupon_scanner_by_store(store, website)
+        coupon_scanner_info = await run_in_threadpool(get_coupon_scanner_by_store, store, website)
         
         if not coupon_scanner_info:
             return client_error_response("Not found coupon scanner link")

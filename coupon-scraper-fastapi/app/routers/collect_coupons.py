@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Query
+from fastapi.concurrency import run_in_threadpool
 from app.lib.response import (
     success_response,
     client_error_response,
@@ -38,7 +39,8 @@ async def collect_coupons_from_website(
             # These are async functions - use await since we're in an async route handler
             coupons = await fetch_func(links_list)
         else:
-            coupons = fetch_func(links_list)
+            # Sync scrapers block, so run them in a worker thread to keep the server responsive
+            coupons = await run_in_threadpool(fetch_func, links_list)
         
         # Remove duplicates
         coupons = list(set(coupons))

@@ -165,7 +165,7 @@ def execute_scrapers(
 
 
 @router.get("/collect-links")
-async def collect_links(
+def collect_links(
     domain: str = Query(..., description="Domain name"),
     handle: str = Query(..., description="Handle name"),
     query: str = Query(..., description="Query name"),
