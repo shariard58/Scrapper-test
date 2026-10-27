@@ -1,0 +1,9 @@
+watchfiles
+beautifulsoup4==4.12.3
+cloudscraper==1.2.71
+requests==2.32.3
+selenium==4.27.1
+webdriver-manager==4.0.2
+zenrows==1.4.0
+fake-useragent==1.5.1
+ratelimit==2.2.1
