@@ -111,7 +111,7 @@ printSummary(handles, storeDomain)  # sites with links first, then empty ones, t
 | tenereteam | Works | `https://{slug}.tenereteam.com/coupons`. Counts the page only if an offer in the page data has a `coupon_code`. |
 | couponcause | Works | `https://couponcause.com/stores/{slug}/`. Counts the page only if the canonical is a store page and an offer links to a code reveal (`?_c=`). Unknown stores return 200 with a "Page Not Found" page. |
 | goodsearch | Works | `https://www.goodsearch.com/coupons/{storeDomain}`. Same layout as Goodshop: counts the page only if a JSON-LD offer for this store has a `discountCode`. |
-| valuecom | Works | `https://{slug}.valuecom.com/`, then `https://store{slug}.valuecom.com/` (slug without hyphens). Counts the page only if a JSON-LD offer has a `couponCode`. Sometimes blocks requests (422). |
+| valuecom | Works | `https://{slug}.valuecom.com/`, then `https://store{slug}.valuecom.com/` (slug without hyphens). Counts the page only if a JSON-LD offer has a `couponCode`. Often blocks requests (422) or cuts the page off, so it retries up to 8 times. |
 | lovecoupons | Works | `https://www.lovecoupons.com/{slug}`. Counts the page only if an offer for this brand has `data-type="2"` (coupon); sales are type 3. |
 | knoji | Always empty | Every store URL returns 410 Gone; the homepage redirects to SimplyCodes. No request is sent; use `simplycodes()`. |
 | swagbucks | Always empty | Store pages show cash back only, no coupon codes (checked on Kohl's). No request is sent. |
@@ -131,7 +131,7 @@ printSummary(handles, storeDomain)  # sites with links first, then empty ones, t
 | coupongrouphy | Works | `https://coupongrouphy.com/dealstore/{slug}/`, then `/dealstore/{slug}thuy/`. Counts the page only if a `masked_coupon` has a code. Usually needs the JS-rendering retry. |
 | joincheckmate | Works | `https://joincheckmate.com/merchants/{storeDomain}`. Counts the page only if a masked code (e.g. `INS####`) is shown. |
 | faircoupons | Always empty | Site is down; the server does not respond. No request is sent. |
-| gocashback | Works | `https://www.gocashback.com/stores/{slug}` (no hyphens). Always fetched with JS rendering, since coupons only appear after scripts run. Counts the page only if a "Code:" block exists. |
+| gocashback | Works | `https://www.gocashback.com/stores/{slug}` (no hyphens). Always fetched with JS rendering, since coupons only appear after scripts run. Counts the page only if a "Code:" block exists; fetched a second time if the first render has none. |
 | trustdeals | Works | `https://www.trustdeals.com/view/{storeDomain}`. Counts the page if a code offer exists, including the generic "most common codewords at similar shops" (SAVE10, WELCOME), to match the live project; expired codes are skipped. |
 | couponupto | Works | `https://www.couponupto.com/coupons/{slug}`. Counts the page only if the canonical is a store page and an offer shows a code. Unknown stores redirect to the homepage. |
 | promosreview | Works | `https://www.promosreview.com/store/{Name}-coupon-codes` (name without spaces, original case, e.g. `CozyEarth`). Counts only codes whose `data-url` is the store's own site. |
@@ -142,7 +142,7 @@ printSummary(handles, storeDomain)  # sites with links first, then empty ones, t
 | xyzcodes | Works | `https://www.xyzcodes.com/store/{slug}/`, then `/store/{domain-with-hyphens}/`. Counts the page only if an offer link has `data-type="code"`. Pages often need the JS-challenge retry. |
 | coponcodes | Works | `https://coponcodes.com/store/...`, trying `{slug}`, `{domain-with-hyphens}`, `{slug}-promo-codes` and `{slug}-coupon-code`. Counts the page only if a hidden code (`<span id="code-..." hidden>`) exists. |
 | dealam | Works | `https://www.dealam.com/coupons/{slug}/`. Counts only `dx_code_coupons` offers that aren't ads (`new-class-ads`). |
-| latestdeals | Works | `https://www.latestdeals.co.uk/retailers/{storeDomain}`. Always fetched with JS rendering (AWS WAF challenge). Counts only active "Get Code" buttons; expired "Check Code" ones are skipped. |
+| latestdeals | Works | `https://www.latestdeals.co.uk/retailers/{storeDomain}`. Checked through `/api/posts?merchantSlugDomain={storeDomain}&type=voucher&type=offer`; counts the page only if a post has a code. |
 | kotag | Works | Uses `kotag.co` (kotag.com is for sale): `https://kotag.co/us/marques/codes-promo-{slug}/`. Influencer codes. Counts the page only if `pageProps.coupons` in the page data has a non-expired code. |
 | zensaving | Always empty | Uses `zensaving.com` (zensavings.com is parked). Store pages `/store/{slug}` list only deals; 16 stores checked, none had a code. No request is sent. |
 | couponsgo | Works | Uses `couponsgo.org` (.com and .net are parked): `/{slug}`, then `/{storeDomain}`, then `/search?query={name}`. Counts only offers whose `data-domain` is this store and whose button shows a code tail instead of "Get Deal". |

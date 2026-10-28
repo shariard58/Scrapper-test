@@ -26,7 +26,7 @@ Last checked: 2026-10-25, using ZenRows with Cozy Earth (`cozyearth.com`) as the
 | tenereteam | ✅ Working | None. Codes are embedded in the page data. |
 | couponcause | ✅ Working | None for finding pages with codes. The code text is only revealed after clicking "Show Code". |
 | goodsearch | ✅ Working | None for finding pages with codes. Same company and layout as Goodshop; most codes are masked. |
-| valuecom | ✅ Working | Sometimes blocks requests (422) or returns a cut-off page with no content, but retries usually get through. Codes are embedded in the page data. ("valuecom" is valuecom.com; value.com is an unrelated parked domain.) |
+| valuecom | ✅ Working | Often blocks requests (422) or returns a cut-off page with no content; the link check retries up to 8 times with a short pause. Codes are embedded in the page data. ("valuecom" is valuecom.com; value.com is an unrelated parked domain.) |
 | lovecoupons | ✅ Working | None. Each offer is marked as coupon or sale in the page HTML. |
 | refermate | ✅ Working | None. Codes are embedded in the page data. |
 | discountreactor | ✅ Working | None for finding pages with codes. Codes are masked (e.g. `••••••OZY`) until clicked. |
@@ -42,7 +42,7 @@ Last checked: 2026-10-25, using ZenRows with Cozy Earth (`cozyearth.com`) as the
 | savingheist | ✅ Working | Some pages first show a "One moment, please..." challenge, which a JS-rendered retry gets past. Full codes are in the page HTML. |
 | coupongrouphy | ✅ Working | Small WordPress site; pages usually show a challenge first, so JS rendering is needed. Store URLs often end in "thuy", which makes them hard to guess. |
 | joincheckmate | ✅ Working | None for finding pages with codes. Codes are masked (e.g. `INS####`). |
-| gocashback | ✅ Working | Coupons only appear with JS rendering, so every check costs a rendered request. |
+| gocashback | ✅ Working | Coupons only appear with JS rendering, so every check costs a rendered request. The rendered page sometimes comes back without coupons, so it is fetched a second time when no "Code:" block is found. |
 | trustdeals | ✅ Working | Pages also list generic "most common codewords at similar shops" (SAVE10, WELCOME). These count as codes, to match the live project. |
 | couponupto | ✅ Working | None. Full codes are in the page HTML. |
 | promosreview | ✅ Working | Store URLs use the name in its original case (`CozyEarth`), so lowercase or hyphenated names don't work. |
@@ -54,7 +54,7 @@ Last checked: 2026-10-25, using ZenRows with Cozy Earth (`cozyearth.com`) as the
 | xyzcodes | ✅ Working | Pages often show a "One moment, please..." challenge first, which the JS-rendered retry gets past. Store URLs vary (`yardzen`, `golfballs-com`). |
 | coponcodes | ✅ Working | Store URLs vary a lot (`aosom-uk`, `bioptimizers-com`, `avidlove-promo-codes`), so some stores may be missed. Full codes are in the page HTML. |
 | dealam | ✅ Working | Some "code" cards are ads for other offers; those are skipped. |
-| latestdeals | ✅ Working | UK site behind an AWS WAF challenge, so every check needs JS rendering. Shows only the last 2 characters of each code. |
+| latestdeals | ✅ Working | UK site behind an AWS WAF challenge. The link check uses the site's posts API (no JS rendering), which returns full codes for the store. |
 | kotag | ✅ Working | The real site is kotag.co (kotag.com is a domain for sale). Influencer promo codes, full codes in the page data. |
 | zensaving | ❌ Not possible | The real site is zensaving.com (zensavings.com is parked). It is live, but its store pages list only deals: 16 stores checked, 130+ offers, no codes. |
 | couponsgo | ✅ Working | The real site is couponsgo.org (.com and .net are parked). Many stores have no page of their own but appear in the site search. Shows only the last 4 characters of each code. |

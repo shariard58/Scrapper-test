@@ -52,6 +52,28 @@ def getRendered(url):
     return response.text, response.status_code
 
 
+def plainRetry(url, tries=8, pause=3):
+    """For sites that block most requests at random (valuecom): plain requests only, a few seconds apart.
+    JS rendering does not get through there any better."""
+    for attempt in range(tries):
+        response = client.get(url, timeout=TIMEOUT)
+        # A cut-off page with only <head> counts as another blocked try
+        cutOff = response.status_code == 200 and "<body" not in response.text.lower()
+        if response.status_code != 422 and not cutOff:
+            break
+        if attempt < tries - 1:
+            time.sleep(pause)
+    return response.text, response.status_code
+
+
+def renderedTwice(url):
+    """JS-rendered fetch that asks once more when the coupons did not load in time (gocashback)."""
+    response, status = getRendered(url)
+    if status == 200 and 'class="codetext">Code:</span>' not in response:
+        response, status = getRendered(url)
+    return response, status
+
+
 def fetchOnce(url):
     """One plain request, no retries: for sites where an unknown store always comes back as 422."""
     response = client.get(url, timeout=TIMEOUT)
@@ -106,7 +128,9 @@ def checkUrl(siteName, url, isValid, recheck=False, fetch=get_response):
             print(f"{R}Challenge page, retrying with JS rendering: {url}{E}")
             response, status = getRendered(url)
         # Some sites (e.g. valuecom) occasionally return a cut-off page with only <head>; ask once more
-        if status == 200 and "<body" not in response.lower():
+        # JSON answers (site APIs) have no <body>, so only HTML pages are checked
+        isHtml = response.lstrip().startswith("<")
+        if status == 200 and isHtml and "<body" not in response.lower():
             print(f"{R}Incomplete page, retrying: {url}{E}")
             response, status = fetch(url)
             if status == 200 and "<body" not in response.lower():
@@ -437,6 +461,7 @@ def goodsearch(handles, storeDomain, query):
 def valuecom(handles, storeDomain, query):
     # Stores live on subdomains like cozyearth.valuecom.com (no hyphens); a few use store{name}.valuecom.com.
     # Offers are JSON-LD: {"@type":"Offer", ..., "couponCode":"SAMANTHA55", ...}
+    # The site blocks most requests (422) at random, so it gets plain retries instead of get_response.
     return checkSite(
         handles, storeDomain, query, "Valuecom", "valuecom.com",
         lambda name: [
@@ -444,6 +469,7 @@ def valuecom(handles, storeDomain, query):
             f"https://store{name.replace('-', '')}.valuecom.com/",
         ],
         lambda html: bool(re.search(r'"couponCode":"[^"]+"', html)),
+        fetch=plainRetry,
     )
 
 
@@ -650,7 +676,7 @@ def gocashback(handles, storeDomain, query):
         handles, storeDomain, query, "GoCashBack", "gocashback.com",
         lambda name: f"https://www.gocashback.com/stores/{name.replace('-', '')}",
         lambda html: 'class="codetext">Code:</span>' in html,
-        fetch=getRendered,
+        fetch=renderedTwice,
     )
 
 
@@ -878,13 +904,27 @@ def dealam(handles, storeDomain, query):
 
 
 def latestdeals(handles, storeDomain, query):
-    # UK site behind an AWS WAF challenge, so pages are always fetched with JS rendering.
-    # Active codes are "Get Code" buttons holding the code's tail: >Get Code<span data-code="24"; expired ones say "Check Code".
+    # UK site whose store pages sit behind an AWS WAF challenge (JS rendering, often incomplete). The page loads its
+    # offers from the site's own JSON API, which answers plain requests, so the link is checked through the API:
+    # /api/posts?merchantSlugDomain=<domain>&type=voucher&type=offer -> {"entities": {...: {"code": "SPARKS30", ...}}}
+    def fetchApi(pageUrl):
+        domain = pageUrl.rstrip("/").split("/")[-1]
+        return get_response(
+            f"https://www.latestdeals.co.uk/api/posts?merchantSlugDomain={domain}&type=voucher&type=offer&noExcerpts=true"
+        )
+
+    def hasCodes(body):
+        try:
+            posts = (json.loads(body).get("entities") or {}).values()
+        except (ValueError, AttributeError):
+            return False
+        return any(isinstance(post, dict) and post.get("code") for post in posts)
+
     return checkSite(
         handles, storeDomain, query, "LatestDeals", "latestdeals.co.uk",
         lambda name: f"https://www.latestdeals.co.uk/retailers/{storeDomain}",
-        lambda html: bool(re.search(r'>Get Code<span data-code="[^"]+"', html)),
-        fetch=getRendered,
+        hasCodes,
+        fetch=fetchApi,
     )
 
 
