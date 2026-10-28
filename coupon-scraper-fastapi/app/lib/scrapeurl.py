@@ -233,33 +233,29 @@ def honey(handles, storeDomain, query):
     )
 
 
+def rebates_codes(html, domain):
+    """Codes of one store from a rebates.com page (Next.js payload)."""
+    # Offers look like {"title":...,"store":"macys.com",...,"code":"FRIEND","type":"coupon",...}; offers of other
+    # stores are mixed in. Links inside an offer contain braces ("sid={rebates-shopperid}"), so each code is matched
+    # to the nearest "store" before it, and the two keys come in either order.
+    chunks = re.findall(r'self\.__next_f\.push\(\[1,(".*?")\]\)</script>', html, re.S)
+    payload = "".join(json.loads(chunk) for chunk in chunks)
+    codes = []
+    for match in re.finditer(r'"code":"([^"]*)","type":"coupon"|"type":"coupon","code":"([^"]*)"', payload):
+        stores = re.findall(r'"store":"([^"]+)"', payload[max(0, match.start() - 3000):match.start()])
+        if stores and stores[-1] == domain:
+            codes.append((match.group(1) or match.group(2) or "").strip())
+    return list(dict.fromkeys(code for code in codes if code and " " not in code))
+
+
 def rebates(handles, storeDomain, query):
-    extDomain = "rebates"
-    extHandles = handles.copy()
-    hasAlready = isExists(extDomain, storeDomain, handles)
-
-    if storeDomain not in extHandles:
-        extHandles[storeDomain] = {}
-    if not hasAlready:
-        extHandles[storeDomain][extDomain] = []
-
-        url = f"https://rebates.com/search-stores"
-
-        try:
-            response, status = postZenrowsResponse(url, data={"keyword": storeDomain})
-            if not response:
-                return extHandles
-            jsondata = json.loads(response)
-
-            if storeDomain in jsondata:
-                extHandles[storeDomain][extDomain].append(
-                    f"https://rebates.com/coupons/{storeDomain}"
-                )
-
-        except Exception as e:
-            logger.error(f"Error  fetching {url}: {e}")
-
-    return extHandles
+    # Store pages are /coupons/{domain}. Every store gets a page, even with no offers, so the link counts only if
+    # the page holds a coupon code for this store (the old search API returned stores without codes too).
+    return check_site(
+        handles, storeDomain, query, "Rebates", "rebates",
+        lambda name: f"https://rebates.com/coupons/{storeDomain}",
+        lambda html: bool(rebates_codes(html, storeDomain)),
+    )
 
 
 def coupons(handles, storeDomain, query):

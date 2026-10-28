@@ -8,7 +8,7 @@ from html import unescape
 
 from bs4 import BeautifulSoup
 
-from main import TIMEOUT, client, get_response
+from main import TIMEOUT, client, get_response, rebates_codes
 
 G = "\033[92m"
 R = "\033[91m"
@@ -228,6 +228,16 @@ def honey(handles, storeDomain, query):
         handles, storeDomain, query, "Honey", "joinhoney.com",
         lambda name: f"https://www.joinhoney.com/shop/{name}",
         hasCodes,
+    )
+
+
+def rebates(handles, storeDomain, query):
+    # rebates.com (not rebatesme.com). Store pages use the domain; unknown or empty stores still return a page,
+    # so a link counts only if the page holds a coupon code for this store (same parsing as main.scrape_rebates).
+    return checkSite(
+        handles, storeDomain, query, "Rebates", "rebates.com",
+        lambda name: f"https://rebates.com/coupons/{storeDomain}",
+        lambda html: bool(rebates_codes(html, storeDomain)),
     )
 
 
@@ -958,6 +968,7 @@ if __name__ == "__main__":
         capitalone,
         retailmenot,
         honey,
+        rebates,
         rebatesme,
         coupons,
         dealcatcher,

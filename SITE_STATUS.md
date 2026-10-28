@@ -1,6 +1,6 @@
 # Coupon Site Status
 
-Last checked: 2026-10-25, using ZenRows with Cozy Earth (`cozyearth.com`) as the test store. 61 sites so far (last updated 2026-10-26).
+Last checked: 2026-10-25, using ZenRows with Cozy Earth (`cozyearth.com`) as the test store. 62 sites so far (last updated 2026-10-28).
 
 | Site | Status | Problem |
 |---|---|---|
@@ -12,7 +12,8 @@ Last checked: 2026-10-25, using ZenRows with Cozy Earth (`cozyearth.com`) as the
 | capitalone | ✅ Working | None. Codes are shown on the store page. |
 | retailmenot | ✅ Working | None for finding pages with codes. The code text itself is only revealed after clicking "Show Code", so pulling the actual codes needs an extra step. |
 | honey | ✅ Working | None. Codes are embedded in the page data. |
-| rebatesme | ✅ Working | None. Codes are embedded in the page data. ("rebates" was taken to mean RebatesMe.) |
+| rebates | ✅ Working | rebates.com is a different site from RebatesMe (added 2026-10-28). Store pages always load, so a page counts only if it holds a coupon code for the store. Codes are in the page data. |
+| rebatesme | ✅ Working | None. Codes are embedded in the page data. |
 | slickdeals | ❌ Not possible | Slickdeals removed its store coupon pages. Every `/coupons/` URL returns 410 Gone, even for big stores. |
 | coupons | ✅ Working | None. Codes are embedded in the page data. |
 | dontpayfull | ✅ Working | Active and expired codes sit in separate sections. Active codes are masked (e.g. `***UMMER`) until clicked; only expired ones are shown in full. Only active code cards count. |
@@ -110,6 +111,12 @@ Last checked: 2026-10-25, using ZenRows with Cozy Earth (`cozyearth.com`) as the
 - URL format: `https://www.joinhoney.com/shop/{store}` (hyphenated, e.g. `cozy-earth`)
 - Unknown stores return 404.
 - Cozy Earth result: page found with 3 public codes (`UNLOCKCOZY`, `CE-CADE`, `CE-DISCOVERELLE`).
+
+### rebates (rebates.com)
+- URL format: `https://rebates.com/coupons/{storeDomain}`
+- Every store gets a page, even with no offers, so the page counts only if its Next.js data has an offer with `"type":"coupon"` and a code whose `"store"` is the store's domain (other stores' offers are mixed in).
+- Results (2026-10-28): Tommy John 4 codes, Macy's 216 codes; Cozy Earth and NOBULL pages exist but have no codes, so no link.
+- The link check uses `rebates_codes()` from main.py, the same parsing as the code scraper.
 
 ### rebatesme
 - URL format: `https://www.rebatesme.com/en/stores/{store}` (e.g. `cozyearth`)

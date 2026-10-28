@@ -28,6 +28,7 @@ handles = slickdeals(handles, storeDomain, storeQuery)
 handles = capitalone(handles, storeDomain, storeQuery)
 handles = retailmenot(handles, storeDomain, storeQuery)
 handles = honey(handles, storeDomain, storeQuery)
+handles = rebates(handles, storeDomain, storeQuery)
 handles = rebatesme(handles, storeDomain, storeQuery)
 handles = coupons(handles, storeDomain, storeQuery)
 handles = dealcatcher(handles, storeDomain, storeQuery)
@@ -96,6 +97,7 @@ printSummary(handles, storeDomain)  # sites with links first, then empty ones, t
 | capitalone | Works | `https://capitaloneshopping.com/s/{storeDomain}/coupon`. Counts the page only if it has a "Copy code ..." button. |
 | retailmenot | Works | `https://www.retailmenot.com/view/{storeDomain}`. Counts the page only if a non-expired offer of type COUPON exists for `storeDomain`. Unknown stores redirect to the homepage. |
 | honey | Works | `https://www.joinhoney.com/shop/{slug}`. Counts the page only if `publicCouponCount` > 0. |
+| rebates | Works | `https://rebates.com/coupons/{storeDomain}` (rebates.com, not RebatesMe). Counts the page only if it has a coupon code for `storeDomain`; empty store pages still load. |
 | rebatesme | Works | `https://www.rebatesme.com/en/stores/{slug}`. Counts the page only if the store's coupon list has a code. Unknown stores return a generic page with status 200. |
 | slickdeals | Always empty | Coupon pages were removed (410 Gone). No request is sent. |
 | coupons | Works | `https://www.coupons.com/coupon-codes/{slug}`. Counts the page only if a voucher in the page data has a code. |
