@@ -7,7 +7,8 @@ import requests
 from bs4 import BeautifulSoup
 
 from app.lib.helpers import (fetch_once, get_rendered, get_response,
-                             getZenrowsTwoResponse, postZenrowsResponse)
+                             getZenrowsTwoResponse, plain_retry,
+                             postZenrowsResponse, rendered_twice)
 from app.lib.logger import get_logger
 
 # set log level
@@ -58,7 +59,9 @@ def check_url(site_name, url, is_valid, recheck=False, fetch=get_response):
             logger.warning(f"Challenge page, retrying with JS rendering: {url}")
             response, status = get_rendered(url)
         # Some sites (e.g. valuecom) occasionally return a cut-off page with only <head>; ask once more
-        if status == 200 and "<body" not in response.lower():
+        # JSON answers (site APIs) have no <body>, so only HTML pages are checked
+        is_html = response.lstrip().startswith("<")
+        if status == 200 and is_html and "<body" not in response.lower():
             logger.warning(f"Incomplete page, retrying: {url}")
             response, status = fetch(url)
             if status == 200 and "<body" not in response.lower():
@@ -439,6 +442,7 @@ def valuecom(handles, storeDomain, query):
             f"https://store{name.replace('-', '')}.valuecom.com/",
         ],
         lambda html: bool(re.search(r'"couponCode":"[^"]+"', html)),
+        fetch=plain_retry,
     )
 
 
@@ -749,7 +753,7 @@ def gocashback(handles, storeDomain, query):
         handles, storeDomain, query, "GoCashBack", "gocashback",
         lambda name: f"https://www.gocashback.com/stores/{name.replace('-', '')}",
         lambda html: 'class="codetext">Code:</span>' in html,
-        fetch=get_rendered,
+        fetch=rendered_twice,
     )
 
 
@@ -977,13 +981,27 @@ def dealam(handles, storeDomain, query):
 
 
 def latestdeals(handles, storeDomain, query):
-    # UK site behind an AWS WAF challenge, so pages are always fetched with JS rendering.
-    # Active codes are "Get Code" buttons holding the code's tail: >Get Code<span data-code="24"; expired ones say "Check Code".
+    # UK site whose store pages sit behind an AWS WAF challenge (JS rendering, often incomplete). The page loads its
+    # offers from the site's own JSON API, which answers plain requests, so the link is checked through the API:
+    # /api/posts?merchantSlugDomain=<domain>&type=voucher&type=offer -> {"entities": {...: {"code": "SPARKS30", ...}}}
+    def fetch_api(page_url):
+        domain = page_url.rstrip("/").split("/")[-1]
+        return get_response(
+            f"https://www.latestdeals.co.uk/api/posts?merchantSlugDomain={domain}&type=voucher&type=offer&noExcerpts=true"
+        )
+
+    def has_codes(body):
+        try:
+            posts = (json.loads(body).get("entities") or {}).values()
+        except (ValueError, AttributeError):
+            return False
+        return any(isinstance(post, dict) and post.get("code") for post in posts)
+
     return check_site(
         handles, storeDomain, query, "LatestDeals", "latestdeals",
         lambda name: f"https://www.latestdeals.co.uk/retailers/{storeDomain}",
-        lambda html: bool(re.search(r'>Get Code<span data-code="[^"]+"', html)),
-        fetch=get_rendered,
+        has_codes,
+        fetch=fetch_api,
     )
 
 

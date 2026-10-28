@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import re
+import time
 from urllib.request import Request, urlopen
 
 import requests
@@ -352,3 +353,25 @@ def fetch_once(url):
     """One plain request, no retries: for sites where an unknown store always comes back as 422."""
     response = client.get(url, timeout=TIMEOUT)
     return response.text, response.status_code
+
+
+def plain_retry(url, tries=8, pause=3):
+    """For sites that block most requests at random (valuecom): plain requests only, a few seconds apart.
+    JS rendering does not get through there any better."""
+    for attempt in range(tries):
+        response = client.get(url, timeout=TIMEOUT)
+        # A cut-off page with only <head> counts as another blocked try
+        cut_off = response.status_code == 200 and "<body" not in response.text.lower()
+        if response.status_code != 422 and not cut_off:
+            break
+        if attempt < tries - 1:
+            time.sleep(pause)
+    return response.text, response.status_code
+
+
+def rendered_twice(url):
+    """JS-rendered fetch that asks once more when the coupons did not load in time (gocashback)."""
+    response, status = get_rendered(url)
+    if status == 200 and 'class="codetext">Code:</span>' not in response:
+        response, status = get_rendered(url)
+    return response, status

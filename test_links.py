@@ -13,10 +13,11 @@ TEST_LINKS = {
         "https://www.joinhoney.com/shop/tommy-john",
     ],
     "dontpayfull": [
-        "https://www.dontpayfull.com/at/cozyearth.com",
-        "https://www.dontpayfull.com/at/nobullproject.com",
-        "https://www.dontpayfull.com/at/tommyjohn.com",
-        "https://www.dontpayfull.com/at/kohls.com",
+        # "https://www.dontpayfull.com/at/cozyearth.com",
+        # "https://www.dontpayfull.com/at/nobullproject.com",
+        # "https://www.dontpayfull.com/at/tommyjohn.com",
+        # "https://www.dontpayfull.com/at/kohls.com",
+        "https://www.dontpayfull.com/at/softminkyblankets.com"
     ],
     "promocodes": [
         "https://www.promocodes.com/cozy-earth-coupons",
@@ -29,9 +30,10 @@ TEST_LINKS = {
         "https://www.couponchief.com/tommyjohn",
     ],
     "simplycodes": [
-        "https://simplycodes.com/store/cozyearth.com",
-        "https://simplycodes.com/store/nobullproject.com",
-        "https://simplycodes.com/store/tommyjohn.com",
+        # "https://simplycodes.com/store/cozyearth.com",
+        # "https://simplycodes.com/store/nobullproject.com",
+        # "https://simplycodes.com/store/tommyjohn.com",
+        "https://simplycodes.com/store/softminkyblankets.com"
     ],
     "tenereteam": [
         "https://cozy-earth.tenereteam.com/coupons",
@@ -44,9 +46,10 @@ TEST_LINKS = {
         "https://tommyjohn.valuecom.com/",
     ],
     "refermate": [
-        "https://refermate.com/store/cozy-earth/promo-codes",
-        "https://refermate.com/store/nobull/promo-codes",
-        "https://refermate.com/store/tommy-john/promo-codes",
+        # "https://refermate.com/store/cozy-earth/promo-codes",
+        # "https://refermate.com/store/nobull/promo-codes",
+        # "https://refermate.com/store/tommy-john/promo-codes",
+        "https://refermate.com/store/softminkyblankets/promo-codes"
     ],
     "discountreactor": [
         "https://www.discountreactor.com/coupons/cozyearth.com",
@@ -64,9 +67,10 @@ TEST_LINKS = {
         "https://www.greenpromocode.com/coupons/tommy-john/",
     ],
     "couponbind": [
-        "https://www.couponbind.com/coupons/cozyearth.com",
-        "https://www.couponbind.com/coupons/nobullproject.com",
-        "https://www.couponbind.com/coupons/tommyjohn.com",
+        # "https://www.couponbind.com/coupons/cozyearth.com",
+        # "https://www.couponbind.com/coupons/nobullproject.com",
+        # "https://www.couponbind.com/coupons/tommyjohn.com",
+        "https://www.couponbind.com/coupons/softminkyblankets.com"
     ],
     "deala": [
         "https://deala.com/cozy-earth",
@@ -93,41 +97,47 @@ TEST_LINKS = {
         "https://www.coupons.com/coupon-codes/nobull",
     ],
     "goodshop": [
-        "https://www.goodshop.com/coupons/cozyearth.com",
-        "https://www.goodshop.com/coupons/tommyjohn.com",
+        # "https://www.goodshop.com/coupons/cozyearth.com",
+        # "https://www.goodshop.com/coupons/tommyjohn.com",
+        "https://www.goodshop.com/coupons/softminkyblankets.com"
     ],
     "couponcause": [
         "https://couponcause.com/stores/cozy-earth/",
         "https://couponcause.com/stores/tommy-john/",
     ],
     "goodsearch": [
-        "https://www.goodsearch.com/coupons/cozyearth.com",
-        "https://www.goodsearch.com/coupons/tommyjohn.com",
+        # "https://www.goodsearch.com/coupons/cozyearth.com",
+        # "https://www.goodsearch.com/coupons/tommyjohn.com",
+        "https://www.goodsearch.com/coupons/softminkyblankets.com"
     ],
     "dazzdeals": [
         "https://www.dazzdeals.com/store/cozy-earth/",
         "https://www.dazzdeals.com/store/nobullproject/",
     ],
     "joincheckmate": [
-        "https://joincheckmate.com/merchants/cozyearth.com",
-        "https://joincheckmate.com/merchants/tommyjohn.com",
+        # "https://joincheckmate.com/merchants/cozyearth.com",
+        # "https://joincheckmate.com/merchants/tommyjohn.com",
+        "https://joincheckmate.com/merchants/softminkyblankets.com"
     ],
     "couponsgo": [
-        "https://www.couponsgo.org/search?query=cozy+earth",
-        "https://www.couponsgo.org/search?query=nobull",
+        # "https://www.couponsgo.org/search?query=cozy+earth",
+        # "https://www.couponsgo.org/search?query=nobull",
+        "https://www.couponsgo.org/search?query=softminkyblankets"
     ],
     "couponpromo": [
-        "https://couponpromo.net/search?query=cozy+earth",
-        "https://couponpromo.net/search?query=nobull",
+        # "https://couponpromo.net/search?query=cozy+earth",
+        # "https://couponpromo.net/search?query=nobull",
+        "https://couponpromo.net/search?query=softminkyblankets"
     ],
     "kotag": [
         "https://kotag.co/us/marques/codes-promo-cozy-earth/",
         "https://kotag.co/us/marques/codes-promo-tommyjohn/",
     ],
     "retailmenot": [
-        "https://www.retailmenot.com/view/nobullproject.com",
-        "https://www.retailmenot.com/view/tommyjohn.com",
-        "https://www.retailmenot.com/view/ubeauty.com",
+        # "https://www.retailmenot.com/view/nobullproject.com",
+        # "https://www.retailmenot.com/view/tommyjohn.com",
+        # "https://www.retailmenot.com/view/ubeauty.com",
+        "https://www.retailmenot.com/view/softminkyblankets.com"
     ],
     "offers": [
         "https://www.offers.com/stores/nobull/",
@@ -161,8 +171,9 @@ TEST_LINKS = {
         "https://shipthedeal.com/store/colon-broom-coupon",
     ],
     "coupert": [
-        "https://www.coupert.com/shop/tommyjohn.com",
-        "https://www.coupert.com/shop/samsung.com",
+        # "https://www.coupert.com/shop/tommyjohn.com",
+        # "https://www.coupert.com/shop/samsung.com",
+        "https://www.coupert.com/shop/softminkyblankets.com"
     ],
     "lovecoupons": [
         "https://www.lovecoupons.com/tommy-john",

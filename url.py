@@ -988,8 +988,11 @@ if __name__ == "__main__":
     # storeDomain = "cozyearth.com"
     # storeQuery = {"handle": "cozy-earth", "query": ["Cozy Earth"]}
 
-    storeDomain = "tommyjohn.com"
-    storeQuery = {"handle": "tommy-john", "query": ["Tommy John"]}
+    # storeDomain = "tommyjohn.com"
+    # storeQuery = {"handle": "tommy-john", "query": ["Tommy John"]}
+
+    storeDomain = "softminkyblankets.com"
+    storeQuery = {"handle": "softminkyblankets", "query": ["softminkyblankets"]}
 
     # storeDomain = "nobullproject.com"
     # storeQuery = {"handle": "nobull", "query": ["NOBULL", "NOBULL Project"]}
