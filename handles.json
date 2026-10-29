@@ -578,5 +578,13 @@
     "coupongrouphy.com": [],
     "coponcodes.com": [],
     "dazzdeals.com": []
+  },
+  "byltbasics.com": {
+    "savings.com": [
+      "https://www.savings.com/coupons/byltbasics.com"
+    ],
+    "offers.com": [
+      "https://www.offers.com/stores/bylt-basics/"
+    ]
   }
 }

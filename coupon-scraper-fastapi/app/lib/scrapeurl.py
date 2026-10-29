@@ -1,5 +1,6 @@
 import json
 import re
+from collections import Counter
 from html import unescape
 from urllib.parse import quote
 
@@ -326,12 +327,15 @@ def offers(handles, storeDomain, query, algolia=None):
 
 def savings(handles, storeDomain, query):
     # Code offers are <div class="module-deal ... hasCode ..." data-provider-name="Kohl's">.
-    # The page also shows code offers from other (sponsored) brands, so match the provider to the store.
-    names = {normalize(name) for name in slugs(query)}
-
+    # The page also shows a few offers from other (sponsored) brands. The URL is built from the domain and
+    # unknown domains return 404, so the store is the most common provider, even when its name differs from
+    # the query (byltbasics.com is "BYLT").
     def hasCodes(html):
-        providers = re.findall(r'class="module-deal [^"]*\bhasCode\b[^"]*"[^>]*data-provider-name="([^"]+)"', html)
-        return any(normalize(unescape(provider)) in names for provider in providers)
+        offers = re.findall(r'class="module-deal ([^"]*)"[^>]*data-provider-name="([^"]+)"', html)
+        if not offers:
+            return False
+        store = Counter(provider for _, provider in offers).most_common(1)[0][0]
+        return any(provider == store and re.search(r"\bhasCode\b", classes) for classes, provider in offers)
 
     return check_site(
         handles, storeDomain, query, "Savings.com", "savings",

@@ -3,6 +3,7 @@ import json
 import os
 import re
 import time
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from html import unescape
 
@@ -352,12 +353,15 @@ def offers(handles, storeDomain, query):
 
 def savings(handles, storeDomain, query):
     # Code offers are <div class="module-deal ... hasCode ..." data-provider-name="Kohl's">.
-    # The page also shows code offers from other (sponsored) brands, so match the provider to the store.
-    names = {normalize(name) for name in slugs(query)}
-
+    # The page also shows a few offers from other (sponsored) brands. The URL is built from the domain and
+    # unknown domains return 404, so the store is the most common provider, even when its name differs from
+    # the query (byltbasics.com is "BYLT").
     def hasCodes(html):
-        providers = re.findall(r'class="module-deal [^"]*\bhasCode\b[^"]*"[^>]*data-provider-name="([^"]+)"', html)
-        return any(normalize(unescape(provider)) in names for provider in providers)
+        offers = re.findall(r'class="module-deal ([^"]*)"[^>]*data-provider-name="([^"]+)"', html)
+        if not offers:
+            return False
+        store = Counter(provider for _, provider in offers).most_common(1)[0][0]
+        return any(provider == store and re.search(r"\bhasCode\b", classes) for classes, provider in offers)
 
     return checkSite(
         handles, storeDomain, query, "Savings.com", "savings.com",
@@ -991,8 +995,11 @@ if __name__ == "__main__":
     # storeDomain = "tommyjohn.com"
     # storeQuery = {"handle": "tommy-john", "query": ["Tommy John"]}
 
-    storeDomain = "cleanairkits.com"
-    storeQuery = {"handle": "cleanairkits", "query": ["cleanairkits", "clean-airkits"]}
+    # storeDomain = "cleanairkits.com"
+    # storeQuery = {"handle": "cleanairkits", "query": ["cleanairkits", "clean-airkits"]}
+
+    storeDomain = "byltbasics.com"
+    storeQuery = {"handle": "byltbasics", "query": ["byltbasics", "Bylt Basics"]}
 
     # storeDomain = "nobullproject.com"
     # storeQuery = {"handle": "nobull", "query": ["NOBULL", "NOBULL Project"]}
@@ -1002,68 +1009,68 @@ if __name__ == "__main__":
 
     # Comment out a site here to skip it
     SITES = [
-        coupert,
-        discounttime,
-        karmanow,
-        rakuten,
-        hotdeals,
-        slickdeals,
-        capitalone,
-        retailmenot,
-        honey,
-        rebates,
-        rebatesme,
-        coupons,
-        dealcatcher,
-        dontpayfull,
+        # coupert,
+        # discounttime,
+        # karmanow,
+        # rakuten,
+        # hotdeals,
+        # slickdeals,
+        # capitalone,
+        # retailmenot,
+        # honey,
+        # rebates,
+        # rebatesme,
+        # coupons,
+        # dealcatcher,
+        # dontpayfull,
         offers,
         savings,
-        dealspotr,
-        promocodes,
-        couponchief,
-        goodshop,
-        simplycodes,
-        tenereteam,
-        couponcause,
-        goodsearch,
-        valuecom,
-        lovecoupons,
-        knoji,
-        swagbucks,
-        joinsmarty,
-        refermate,
-        discountreactor,
-        couponbox,
-        dealdrop,
-        dazzdeals,
-        greenpromocode,
-        couponbind,
-        deala,
-        promopro,
-        troupon,
-        worthepenny,
-        savingheist,
-        coupongrouphy,
-        joincheckmate,
-        faircoupons,
-        gocashback,
-        trustdeals,
-        couponupto,
-        promosreview,
-        couponsgo,
-        getscoupon,
-        rediscount,
-        couponterra,
-        couponkiss,
-        shipthedeal,
-        couponpromo,
-        couponblender,
-        xyzcodes,
-        kotag,
-        zensaving,
-        coponcodes,
-        dealam,
-        latestdeals,
+        # dealspotr,
+        # promocodes,
+        # couponchief,
+        # goodshop,
+        # simplycodes,
+        # tenereteam,
+        # couponcause,
+        # goodsearch,
+        # valuecom,
+        # lovecoupons,
+        # knoji,
+        # swagbucks,
+        # joinsmarty,
+        # refermate,
+        # discountreactor,
+        # couponbox,
+        # dealdrop,
+        # dazzdeals,
+        # greenpromocode,
+        # couponbind,
+        # deala,
+        # promopro,
+        # troupon,
+        # worthepenny,
+        # savingheist,
+        # coupongrouphy,
+        # joincheckmate,
+        # faircoupons,
+        # gocashback,
+        # trustdeals,
+        # couponupto,
+        # promosreview,
+        # couponsgo,
+        # getscoupon,
+        # rediscount,
+        # couponterra,
+        # couponkiss,
+        # shipthedeal,
+        # couponpromo,
+        # couponblender,
+        # xyzcodes,
+        # kotag,
+        # zensaving,
+        # coponcodes,
+        # dealam,
+        # latestdeals,
     ]
 
     start = time.time()
