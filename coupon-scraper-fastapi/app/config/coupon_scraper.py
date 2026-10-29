@@ -1,14 +1,20 @@
 import asyncio
 import base64
 import json
+import random
 import re
+import time
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from html import unescape
 from urllib.parse import parse_qs, urlparse
 
 import cloudscraper
 import requests  # type: ignore
 from bs4 import BeautifulSoup
+from zenrows import ZenRowsClient
 
+from app.config import settings
 from app.config.headers import headers
 from app.lib.logger import get_logger
 
@@ -23,387 +29,1137 @@ from app.lib.helpers import (extract_coupons_from_html, fetch_page,
                              zenrowsClient)
 
 
-# Helper function: Extract coupon code from coupon object
-def _extract_coupon_code(coupon):
-    """
-    Extract coupon code from a coupon dictionary.
-    Args: coupon (dict) - Dictionary with 'code' key
-    Returns: str or None - Uppercase coupon code or None
-    """
-    if isinstance(coupon, dict) and "code" in coupon and coupon["code"]:
-        return coupon["code"].upper()
+# ---------------------------------------------------------------------------
+# Per-site code scrapers: each scrape_<site>(url) returns the codes found on one store page.
+# They have their own ZenRows client and retry logic; fetch_coupons_from_<site>(links) runs them via _collect.
+# ---------------------------------------------------------------------------
+client = ZenRowsClient(settings.ZENROWS_API_KEY)
+
+# Seconds to wait for one ZenRows request; JS rendering can take a while, but a site should never hang a run
+TIMEOUT = 90
+
+# Try the cheap/fast settings first; if the site blocks us (422), move to the next one
+ATTEMPTS = [
+    {},
+    {},
+    {"js_render": "true", "premium_proxy": "true"},
+]
+
+
+def get_response(url):
+    """Return (html, status). Retries when blocked (422) or when the request itself fails
+    (timeout, network error); any other status, like a 404, returns immediately."""
+    for attempt, params in enumerate(ATTEMPTS, 1):
+        try:
+            response = client.get(url, params=params, timeout=TIMEOUT)
+        except requests.RequestException as e:
+            # The exception text contains the ZenRows URL with the API key, so only its type is shown
+            if attempt == len(ATTEMPTS):
+                raise RuntimeError(f"request failed: {type(e).__name__}") from None
+            logger.warning(f"Retry ({type(e).__name__}) {url}")
+            continue
+        if response.status_code != 422:
+            return response.text, response.status_code
+        # ZenRows puts the error reason in the JSON "title"; never print the URL since it contains the API key
+        try:
+            reason = response.json().get("title")
+        except ValueError:
+            reason = response.text[:200]
+        logger.warning(f"Retry ({response.status_code}) {url}: {reason}")
+    return response.text, response.status_code
+
+
+def fetch_html(url):
+    html, status = get_response(url)
+    if status != 200:
+        raise RuntimeError(f"status {status}")
+    return html
+
+
+def scrape_refermate(url):
+    html = fetch_html(url)
+    # Codes live as "couponCode" inside the hidden Next.js payload (self.__next_f.push)
+    chunks = re.findall(r'self\.__next_f\.push\(\[1,(".*?")\]\)</script>', html, re.S)
+    payload = "".join(json.loads(c) for c in chunks)
+    codes = re.findall(r'"couponCode":"([^"]+)"', payload)
+    return list(dict.fromkeys(c for c in codes if c != "No Code Needed"))
+
+
+def scrape_worthepenny(url):
+    """Return the store's codes from a worthepenny {store}.worthepenny.com/coupon/ page, from one request."""
+    html = fetch_html(url)
+    # Code cards look like data-code="CE-CADE" ... data-coupon_type="code" data-name="Cozy Earth"; deals have
+    # an empty data-code. Keep the most common store name in case cards of other stores show up.
+    offers = re.findall(r'data-code="([^"]+)"[^>]*data-name="([^"]+)"', html)
+    if not offers:
+        return []
+    store = Counter(name for _, name in offers).most_common(1)[0][0]
+    return list(dict.fromkeys(unescape(code).strip() for code, name in offers if name == store))
+
+
+def scrape_hotdeals(url):
+    """Return all codes (active first, then expired) for the store on a hotdeals page, from one request."""
+    html = fetch_html(url)
+
+    # Active codes: <article class="offer-card" data-merchant="cozyearth.com" ... data-code="GETCOZY50">.
+    # The page also shows cards from other stores, so keep only the merchant with the most cards.
+    cards = re.findall(r'<(?:article|section) class="offer-card[^"]*"[^>]*>', html)
+    offers = []
+    for card in cards:
+        merchant = re.search(r'data-merchant="([^"]+)"', card)
+        code = re.search(r'data-code="([^"]+)"', card)
+        if merchant and code:
+            offers.append((merchant.group(1), code.group(1)))
+    active = []
+    if offers:
+        store = Counter(merchant for merchant, _ in offers).most_common(1)[0][0]
+        active = list(dict.fromkeys(code for merchant, code in offers if merchant == store))
+
+    # Expired codes: <section class="expire-coupons"> with each code in <div class="expire-tran-btn-sign">
+    expired = []
+    section = re.search(r'<section class="expire-coupons".*?</section>', html, re.S)
+    if section:
+        codes = re.findall(r'<div class="expire-tran-btn-sign"[^>]*>([^<]+)</div>', section.group(0))
+        expired = list(dict.fromkeys(code.strip() for code in codes if code.strip()))
+
+    return list(dict.fromkeys(active + expired))
+
+
+def scrape_coupert(url):
+    """Return the store's codes from a coupert /shop/{domain} page, from one request."""
+    html = fetch_html(url)
+    # The store's own codes are in the Next.js data at props.pageProps.storeInfo.coupons;
+    # codes elsewhere on the page belong to other featured stores. Coupert lists no expired codes.
+    data = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.S)
+    if not data:
+        return []
+    store = json.loads(data.group(1)).get("props", {}).get("pageProps", {}).get("storeInfo") or {}
+    codes = [(coupon.get("code") or "").strip() for coupon in store.get("coupons") or []]
+    return list(dict.fromkeys(code for code in codes if code))
+
+
+def scrape_joinhoney(url):
+    """Return the store's codes from a joinhoney /shop/{store} page, from one request."""
+    html = fetch_html(url)
+    # Store data is embedded as JSON: "publicCoupons":[{"code":"UNLOCKCOZY","type":"COUPON",...}].
+    # Other "code" keys on the page belong to other stores, so only this list is read.
+    start = html.find('"publicCoupons":')
+    if start == -1:
+        return []
+    coupons, _ = json.JSONDecoder().raw_decode(html, start + len('"publicCoupons":'))
+    codes = [(coupon.get("code") or "").strip() for coupon in coupons if not coupon.get("hidden")]
+    return list(dict.fromkeys(code for code in codes if code))
+
+
+def dontpayfull_reveal(coupon_id, mask):
+    """Return the full code from dontpayfull's "Show code" popup, or None."""
+    html, status = get_response(f"https://www.dontpayfull.com/coupons/getcoupon?id={coupon_id}")
+    code = re.search(r'class="code-box[^"]*"[^>]*>\s*<h2>([^<]+)</h2>', html) if status == 200 else None
+    if not code:
+        return None
+    code = code.group(1).strip()
+    # The card shows the last characters ("***OME10"); a code that doesn't match belongs to another offer
+    return code if code.upper().endswith(mask.lstrip("*").upper()) else None
+
+
+def scrape_dontpayfull(url):
+    """Return all codes (active first, then expired) from a dontpayfull /at/{domain} page."""
+    soup = BeautifulSoup(fetch_html(url), "html.parser")
+
+    # Active codes are masked ("***OME10") until clicked; the click opens /coupons/getcoupon?id=<card id>
+    # with the full code, so each active code costs one extra request.
+    active_cards = []
+    section = soup.select_one("#active-coupons")
+    for card in section.select("article.code") if section else []:
+        mask = card.select_one(".ocode")
+        if card.get("data-id") and mask:
+            active_cards.append((card["data-id"], mask.get_text(strip=True)))
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        active = [code for code in pool.map(lambda c: dontpayfull_reveal(*c), active_cards) if code]
+
+    # Expired codes are shown in full
+    expired = []
+    section = soup.select_one("#expired-coupons")
+    for element in section.select("[data-clipboard-text]") if section else []:
+        expired.append(element["data-clipboard-text"].strip())
+
+    return list(dict.fromkeys(code for code in active + expired if code))
+
+
+def scrape_promocodes(url):
+    """Return the store's codes from a promocodes /{store}-coupons page, from one request."""
+    html = fetch_html(url)
+    # Offers are embedded JSON: "couponCode":"GETCOZY"; deals have "couponCode":null
+    codes = re.findall(r'"couponCode":"([^"]+)"', html)
+    return list(dict.fromkeys(code.strip() for code in codes if code.strip()))
+
+
+def couponchief_reveal(coupon_id, last_char):
+    """Return the full code from couponchief's coupon overlay, or None."""
+    html, status = get_response(f"https://www.couponchief.com/pages/coupon_overlay/{coupon_id}")
+    code = re.search(r'<input[^>]*id="coupon-code"[^>]*value="([^"]+)"', html) if status == 200 else None
+    if not code:
+        return None
+    code = unescape(code.group(1)).strip()
+    # The card shows only the code's last character; a mismatch means the overlay is for another offer
+    return code if code.upper().endswith(last_char.upper()) else None
+
+
+def scrape_couponchief(url):
+    """Return all codes (active first, then expired) from a couponchief /{store} page."""
+    soup = BeautifulSoup(fetch_html(url), "html.parser")
+
+    # Store coupons are <div data-coupon-id="7133304"> cards; code cards show only the last character
+    # in <span class="covered-coupon-code">. Clicking reloads the page with #coupon=<id>, which opens
+    # /pages/coupon_overlay/<id> holding the full code, so each code costs one extra request.
+    # Sidebar cards for other stores have no data-coupon-id.
+    active, expired = [], []
+    for card in soup.select("[data-coupon-id]"):
+        covered = card.select_one(".covered-coupon-code")
+        if covered:
+            target = expired if "Expired" in card.get_text() else active
+            target.append((card["data-coupon-id"], covered.get_text(strip=True)))
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        codes = list(pool.map(lambda c: couponchief_reveal(*c), active + expired))
+
+    return list(dict.fromkeys(code for code in codes if code))
+
+
+def scrape_simplycodes(url):
+    """Return all codes (working first, then failing) from a simplycodes /store/{domain} page, from one request."""
+    html = fetch_html(url)
+    # Code buttons look like data-code="welcome10" ... data-merchant-url="https://cozyearth.com/".
+    # Related stores use data-merchant-url="/store/other.com", so keep the most common absolute merchant URL.
+    # Cards carry data-health="green" (working now) or "red" (failing recently).
+    offers = []
+    for tag in re.findall(r'<[^>]*data-code="[^"]+"[^>]*>', html):
+        code = re.search(r'data-code="([^"]+)"', tag).group(1).strip()
+        merchant = re.search(r'data-merchant-url="(https?://[^"]+)"', tag)
+        health = re.search(r'data-health="([^"]+)"', tag)
+        if merchant:
+            offers.append((merchant.group(1), unescape(code), health.group(1) if health else None))
+    if not offers:
+        return []
+    store = Counter(merchant for merchant, _, _ in offers).most_common(1)[0][0]
+    offers = [(code, health) for merchant, code, health in offers if merchant == store]
+    # A code appears on several buttons; only the card button carries its health
+    failing = {code for code, health in offers if health == "red"}
+    codes = list(dict.fromkeys(code for code, _ in offers))
+    return [c for c in codes if c not in failing] + [c for c in codes if c in failing]
+
+
+def scrape_tenereteam(url):
+    """Return the store's codes from a tenereteam {store}.tenereteam.com/coupons page, from one request."""
+    html = fetch_html(url)
+    # Offers are JSON inside the Next.js payload (self.__next_f.push): {"coupon_code":"WELCOME10",...,
+    # "store":{"alias":"cozy-earth",...}}. Some offers reference the store indirectly and carry no alias.
+    chunks = re.findall(r'self\.__next_f\.push\(\[1,(".*?")\]\)</script>', html, re.S)
+    payload = "".join(json.loads(chunk) for chunk in chunks)
+    matches = list(re.finditer(r'"coupon_code":"([^"]+)"', payload))
+    offers = []
+    for i, match in enumerate(matches):
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(payload)
+        alias = re.search(r'"alias":"([^"]+)"', payload[match.end():end])
+        offers.append((match.group(1).strip(), alias.group(1) if alias else None))
+    aliases = [alias for _, alias in offers if alias]
+    if not aliases:
+        return []
+    store = Counter(aliases).most_common(1)[0][0]
+    # The same code is sometimes listed in different case ("lovett" and "LOVETT"); keep the first
+    codes = {}
+    for code, alias in offers:
+        if code and alias in (store, None):
+            codes.setdefault(code.upper(), code)
+    return list(codes.values())
+
+
+def fetch_plain_retry(url, tries=8, pause=3):
+    """For sites that block most requests at random: plain requests only, a few seconds apart.
+    JS rendering and premium proxies did not get through any better on these sites."""
+    for attempt in range(1, tries + 1):
+        try:
+            response = client.get(url, timeout=TIMEOUT)
+            # A cut-off page with only <head> counts as a failed try
+            if response.status_code == 200 and "<body" in response.text.lower():
+                return response.text
+            if response.status_code not in (422, 429, 200) and response.status_code < 500:
+                raise RuntimeError(f"status {response.status_code}")
+        except requests.RequestException as e:
+            logger.warning(f"Retry ({type(e).__name__}) {url}")
+        if attempt < tries:
+            time.sleep(pause)
+    raise RuntimeError(f"blocked {tries} times")
+
+
+def scrape_valuecom(url):
+    """Return the store's codes from a valuecom {store}.valuecom.com page."""
+    # valuecom blocks most requests (422) at random, so it gets plain retries instead of get_response
+    html = fetch_plain_retry(url)
+    # The store's offers are JSON-LD: {"@type":"Offer",...,"couponCode":"SA50-tuoiVn",...}.
+    # The "Similar Store Coupons" section shows other stores' codes in the HTML, but not in the JSON-LD.
+    codes = re.findall(r'"couponCode":"([^"]+)"', html)
+    return list(dict.fromkeys(code.strip() for code in codes if code.strip()))
+
+
+def scrape_discountreactor(url):
+    """Return the store's codes from a discountreactor /coupons/{store} page, with one extra request."""
+    # Codes are masked on the page: <a data-shop-alias="cozyearth.com"> <div data-offer-code="2669028"
+    # data-code="••••••OZY">. The page's own script reveals them all at once with
+    # POST /offer/codes {"ids": [...]}, which needs the page's CSRF token and cookies from the same session.
+    session = {"session_id": str(random.randint(1, 99999))}
+    for attempt in range(len(ATTEMPTS)):
+        page = client.get(url, params=session, timeout=TIMEOUT)
+        if page.status_code != 422:
+            break
+        logger.warning(f"Retry ({page.status_code}) {url}")
+    if page.status_code != 200:
+        raise RuntimeError(f"status {page.status_code}")
+    html = page.text
+
+    # Cards for related stores are mixed in, so keep the most common shop alias
+    cards = re.findall(
+        r'data-shop-alias="([^"]+)"[^>]*>\s*<div class="offer-list-item-button_hidden-code" '
+        r'data-offer-code="(\d+)" data-code="([^"]*)"', html,
+    )
+    if not cards:
+        return []
+    store = Counter(alias for alias, _, _ in cards).most_common(1)[0][0]
+    masks = {int(offer_id): mask for alias, offer_id, mask in cards if alias == store}
+
+    token = re.search(r'name="csrf-token" content="([^"]+)"', html)
+    headers = {
+        "X-CSRF-TOKEN": token.group(1) if token else "",
+        "X-Requested-With": "XMLHttpRequest",
+        "Content-Type": "application/json",
+        "Cookie": page.headers.get("Zr-Cookies", ""),
+    }
+    codes = []
+    ids = list(masks)
+    for start in range(0, len(ids), 50):  # the site's script sends at most 50 ids per request
+        response = client.post(
+            "https://www.discountreactor.com/offer/codes",
+            params={**session, "custom_headers": "true"},
+            headers=headers,
+            data=json.dumps({"ids": ids[start:start + 50]}),
+            timeout=TIMEOUT,
+        )
+        if response.status_code != 200:
+            logger.warning(f"Could not reveal codes ({response.status_code}) {url}")
+            continue
+        for item in response.json().get("data", {}).get("codes", []):
+            code = (item.get("code") or "").strip()
+            # The card shows the code's last characters ("••••••OZY"); skip anything that doesn't match
+            if code and code.upper().endswith(masks.get(item.get("id"), "").lstrip("•").upper()):
+                codes.append(code)
+    return list(dict.fromkeys(codes))
+
+
+def scrape_dealdrop(url):
+    """Return the store's codes from a dealdrop /{store} page, from one request."""
+    html = fetch_html(url)
+    # The page shows only the last 2 characters of each code, but the SvelteKit data script holds them in full,
+    # either as b.coupon_code="OKSANA45" or as {coupon_code:"SUSAN40",...}
+    data = next((s for s in re.findall(r"<script[^>]*>(.*?)</script>", html, re.S) if "__sveltekit" in s), "")
+    codes = re.findall(r'\.coupon_code="([^"]+)"|\bcoupon_code:"([^"]+)"', data)
+    return list(dict.fromkeys(code.strip() for pair in codes for code in pair if code.strip()))
+
+
+def scrape_greenpromocode(url):
+    """Return the store's codes from a greenpromocode /coupons/{store}/ page, with one extra request."""
+    page = url.split("?")[0]
+    html = fetch_html(page)
+    # Code offers show only the last characters: <div class="go_link" view-href="/coupons/cozy-earth/?view=11609534">.
+    # Clicking reloads the page with ?view=<id>, and that version shows every code on the page in full
+    # as data-clipboard-text, so one extra request reveals them all.
+    slug = page.rstrip("/").split("/")[-1]
+    view = re.search(rf'view-href="/coupons/{re.escape(slug)}/\?view=(\d+)"', html)
+    if not view:
+        return []
+    soup = BeautifulSoup(fetch_html(f"{page}?view={view.group(1)}"), "html.parser")
+    codes = [unescape(el["data-clipboard-text"]).strip() for el in soup.select(".coupon_item [data-clipboard-text]")]
+    return list(dict.fromkeys(code for code in codes if code))
+
+
+def scrape_couponbind(url):
+    """Return all codes (active first, then expired) from a couponbind /coupons/{domain} page, from one request."""
+    html = fetch_html(url)
+    # Each code card (<div class="... codeblock ... code" data-cid="...">) holds the full code in
+    # <span class="hiddenCode">; expired codes sit lower on the page under "Expired ... Promo Codes".
+    soup = BeautifulSoup(html, "html.parser")
+    codes = [span.get_text(strip=True) for span in soup.select(".codeblock span.hiddenCode")]
+    return list(dict.fromkeys(code for code in codes if code))
+
+
+def scrape_deala(url):
+    """Return all codes (active first, then inactive) from a deala /{store} page, from one request."""
+    html = fetch_html(url)
+    # The page hides codes behind "Get code", but Angular's transfer state
+    # (<script id="serverApp-state">, with &q; for quotes) holds them in full:
+    # "store-view-page-coupons-highlight" (ACTIVE) and "store-view-page-coupons-other" (INACTIVE).
+    state = re.search(r'<script[^>]*id="serverApp-state"[^>]*>(.*?)</script>', html, re.S)
+    if not state:
+        return []
+    text = state.group(1)
+    for escaped, char in (("&q;", '"'), ("&s;", "'"), ("&l;", "<"), ("&g;", ">"), ("&a;", "&")):
+        text = text.replace(escaped, char)
+    data = json.loads(text)
+    store = (data.get("store-view-page-store", {}).get("result") or {}).get("alias")
+    codes = []
+    for key in ("store-view-page-coupons-highlight", "store-view-page-coupons-other"):
+        result = data.get(key, {}).get("result") or {}
+        if (result.get("totalPages") or 1) > 1:
+            logger.warning(f"Only the first page of {key} is read: {url}")
+        for coupon in result.get("data") or []:
+            if (coupon.get("shop") or {}).get("alias") == store and coupon.get("code"):
+                codes.append(coupon["code"].strip())
+    return list(dict.fromkeys(code for code in codes if code))
+
+
+def codes_by_store_url(html):
+    """Codes from tags like data-code="PJ-BOGO" data-url="https://cozyearth.com" (promosreview, getscoupon).
+    "Featured Coupons" of other stores point elsewhere, so keep the most common data-url."""
+    offers = re.findall(r'data-code="([^"]+)"\s+data-url="([^"]*)"', html)
+    if not offers:
+        return []
+    store = Counter(link for _, link in offers).most_common(1)[0][0]
+    return list(dict.fromkeys(unescape(code).strip() for code, link in offers if link == store))
+
+
+def scrape_promosreview(url):
+    """Return the store's codes (active and expired) from a promosreview /store/{Name}-coupon-codes page."""
+    return codes_by_store_url(fetch_html(url))
+
+
+def scrape_getscoupon(url):
+    """Return the store's codes (active and expired) from a getscoupon /store/{domain} page."""
+    return codes_by_store_url(fetch_html(url))
+
+
+def scrape_dealam(url):
+    """Return the store's codes from a dealam /coupons/{store}/ page, from one request."""
+    html = fetch_html(url)
+    # Code cards are <div class="dx_code_coupons ..."> holding data-clipboard-text="COZY300" and the store name in
+    # <ul class="time_success"><li>Cozy Earth</li>. Cards with "new-class-ads" are ads for other offers.
+    starts = [m.start() for m in re.finditer(r'class="dx_code_coupons', html)] + [len(html)]
+    offers = []
+    for start, end in zip(starts, starts[1:]):
+        card = html[start:end]
+        if card.startswith('class="dx_code_coupons new-class-ads'):
+            continue
+        code = re.search(r'data-clipboard-text="([^"]+)"', card)
+        store = re.search(r'<ul class="time_success[^"]*">\s*<li>([^<]+)</li>', card)
+        if code:
+            offers.append((unescape(code.group(1)).strip(), store.group(1).strip() if store else None))
+    names = [name for _, name in offers if name]
+    store = Counter(names).most_common(1)[0][0] if names else None
+    # Some cards only ever show a masked code ("••••••FE", even in their popup) or the placeholder "Applied"
+    return list(dict.fromkeys(
+        code for code, name in offers
+        if code and name in (store, None) and "•" not in code and code.lower() != "applied"
+    ))
+
+
+def scrape_coupons(url):
+    """Return the store's codes from a coupons.com /coupon-codes/{store} page, from one request."""
+    html = fetch_html(url)
+    # Vouchers are JSON inside the Next.js payload (self.__next_f.push): ..."code":"WELCOME10","description":...
+    # followed by "retailer":{..."name":"Cozy Earth"...}. Matching the "description" key skips icon names
+    # stored under "code"; the last voucher's retailer is sometimes left out, so a missing name is kept.
+    chunks = re.findall(r'self\.__next_f\.push\(\[1,(".*?")\]\)</script>', html, re.S)
+    payload = "".join(json.loads(chunk) for chunk in chunks)
+    matches = list(re.finditer(r'"code":"([^"]+)","description', payload))
+    offers = []
+    for i, match in enumerate(matches):
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(payload)
+        retailer = re.search(r'"retailer":\{[^{}]*?"name":"([^"]+)"', payload[match.end():end])
+        offers.append((match.group(1).strip(), retailer.group(1) if retailer else None))
+    names = [name for _, name in offers if name]
+    store = Counter(names).most_common(1)[0][0] if names else None
+    return list(dict.fromkeys(code for code, name in offers if code and name in (store, None)))
+
+
+def goodshop_codes(html):
+    """Unmasked codes from goodshop deal cards: <article data-deal-id data-merchant-id> with
+    <div class="deal-button has-code" data-clipboard-text="CE-DISCOVERELLE">. Masked ones look like "••••••LOW"."""
+    soup = BeautifulSoup(html, "html.parser")
+    offers = []
+    for card in soup.select("article[data-deal-id]"):
+        button = card.select_one(".deal-button[data-clipboard-text]")
+        if button:
+            offers.append((unescape(button["data-clipboard-text"]).strip(), card.get("data-merchant-id")))
+    merchants = [merchant for _, merchant in offers if merchant]
+    store = Counter(merchants).most_common(1)[0][0] if merchants else None
+    return [code for code, merchant in offers if code and "•" not in code and merchant in (store, None)]
+
+
+def scrape_goodshop(url):
+    """Return the store's unmasked codes from a goodshop /coupons/{domain} page, with one extra request."""
+    page = url.split("?")[0]
+    # The normal page masks most new codes ("••••••LOW"), and no click reveals them without leaving for the store.
+    # Any ?open=<id> URL returns an older version of the page with every code in full (the same codes Goodsearch
+    # shows), so both versions are read.
+    codes = goodshop_codes(fetch_html(page)) + goodshop_codes(fetch_html(f"{page}?open=1"))
+    return list(dict.fromkeys(codes))
+
+
+def scrape_goodsearch(url):
+    """Return the store's codes from a goodsearch /coupons/{domain} page, from one request."""
+    html = fetch_html(url)
+    # Same company as Goodshop. Offers are JSON-LD, each tied to the store page:
+    # {"@id":"https://www.goodsearch.com/coupons/cozyearth.com#72866609",...,"discountCode":"CE-DISCOVERELLE"}
+    page = re.escape(url.split("?")[0].rstrip("/"))
+    codes = re.findall(rf'{page}#\d+"[^{{}}]*"discountCode":"([^"]+)"', html)
+    return list(dict.fromkeys(code.strip() for code in codes if code.strip() and "•" not in code))
+
+
+def couponcause_reveal(page, offer_id):
+    """Return the full code from couponcause's coupon modal for one offer, or None."""
+    html, status = get_response(f"{page}?_c={offer_id}")
+    code = re.search(r'id="offerCode_js"[^>]*>([^<]+)<', html) if status == 200 else None
+    return unescape(code.group(1)).strip() if code else None
+
+
+def scrape_couponcause(url):
+    """Return the store's codes from a couponcause /stores/{store}/ page."""
+    page = url.split("?")[0]
+    html = fetch_html(page)
+    # Codes are hidden on the page. Code offers carry data-redirect-url="/stores/cozy-earth/?_c=20099"
+    # (deals have no ?_c=); that URL opens the page with a modal holding the code in <h3 id="offerCode_js">,
+    # so each code costs one extra request. The /go2/ links go to the store and are never requested.
+    path = re.escape(page.split("couponcause.com")[-1])
+    ids = list(dict.fromkeys(re.findall(rf'data-redirect-url="{path}\?_c=(\d+)"', html)))
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        codes = list(pool.map(lambda offer_id: couponcause_reveal(page, offer_id), ids))
+    return list(dict.fromkeys(code for code in codes if code))
+
+
+def dazzdeals_reveal(cp, tail):
+    """Return the full code from dazzdeals' /offer/<cp>/ page, or None."""
+    html, status = get_response(f"https://www.dazzdeals.com/offer/{cp}/")
+    code = re.search(r'class="copy_code[^"]*"[^>]*>([^<]+)<', html) if status == 200 else None
+    if not code:
+        return None
+    code = unescape(code.group(1)).strip()
+    # The card shows the code's last characters ("PNIK"); a mismatch means the page is for another offer
+    return code if code.upper().endswith(tail.upper()) else None
+
+
+def scrape_dazzdeals(url):
+    """Return the store's codes from a dazzdeals /store/{store}/ page."""
+    html = fetch_html(url)
+    # Code cards hold only the code's tail: <a class="couponBtn hidden showCouponCode showcode"
+    # href="/redirect/..." data-cp="42926a...">PNIK</a>. Clicking opens the site's own /offer/<data-cp>/
+    # page with the full code in class="copy_code"; /redirect/ goes to the store and is never requested.
+    offers = dict(re.findall(r'class="couponBtn hidden showCouponCode showcode"[^>]*data-cp="([^"]+)"[^>]*>([^<]+)<', html))
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        codes = list(pool.map(lambda item: dazzdeals_reveal(*item), offers.items()))
+    return list(dict.fromkeys(code for code in codes if code))
+
+
+def joincheckmate_reveal(page, code_id):
+    """Return the full code from joincheckmate's code modal page, or None."""
+    html, status = get_response(f"{page}/modal?code={code_id}")
+    if status != 200:
+        return None
+    # The modal's React Router data has ...\"id\",\"<code id>\",\"value\",\"INSTYLEEXCLUSIVE\"...
+    code = re.search(rf'\\?"id\\?",\\?"{re.escape(code_id)}\\?",\\?"value\\?",\\?"([^"\\]+)', html)
+    return code.group(1).strip() if code else None
+
+
+def scrape_joincheckmate(url):
+    """Return the store's codes from a joincheckmate /merchants/{domain} page."""
+    page = url.split("?")[0].rstrip("/")
+    html = fetch_html(page)
+    # Codes are masked on the page ("INS#############") and every card links to /mr/..., which goes to the store.
+    # The page data lists each code's modal, {page}/modal?code=<id>, and that page holds the full code,
+    # so each code costs one extra request.
+    ids = list(dict.fromkeys(re.findall(rf'{re.escape(page)}/modal\?code=([0-9a-z]+)', html)))
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        codes = list(pool.map(lambda code_id: joincheckmate_reveal(page, code_id), ids))
+    return list(dict.fromkeys(code for code in codes if code))
+
+
+def couponsgo_reveal(url, coupon_id, tail):
+    """Return the full code from couponsgo's coupon dialog (?cid=<id>), or None."""
+    separator = "&" if "?" in url else "?"
+    html, status = get_response(f"{url}{separator}cid={coupon_id}")
+    code = re.search(r'class="code-str[^"]*"[^>]*>([^<]+)<', html) if status == 200 else None
+    if not code:
+        return None
+    code = unescape(code.group(1)).strip()
+    # The card shows the code's last characters; a mismatch means the dialog is for another offer
+    return code if code.upper().endswith(tail.upper()) else None
+
+
+def scrape_couponsgo(url):
+    """Return the store's codes from a couponsgo.org store or search page."""
+    soup = BeautifulSoup(fetch_html(url), "html.parser")
+    # Offers are <div class="coupon-item" data-domain="nobullproject.com" data-value="835949f5b27f815e">; code offers
+    # show only the code's tail in <a class="coupon_button"><p>UDEN</p>, deals say "Get Deal". Clicking opens the
+    # same page with ?cid=<data-value>, whose dialog has the full code in class="code-str". /go/ links go to the store.
+    offers = []
+    for item in soup.select(".coupon-item[data-domain][data-value]"):
+        button = item.select_one("a.coupon_button p")
+        tail = button.get_text(strip=True) if button else ""
+        if tail and tail != "Get Deal":
+            offers.append((item["data-domain"], item["data-value"], tail))
+    if not offers:
+        return []
+    # Search pages also list other stores, so keep the most common domain
+    store = Counter(domain for domain, _, _ in offers).most_common(1)[0][0]
+    targets = list(dict.fromkeys((coupon_id, tail) for domain, coupon_id, tail in offers if domain == store))
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        codes = list(pool.map(lambda target: couponsgo_reveal(url, *target), targets))
+    return list(dict.fromkeys(code for code in codes if code))
+
+
+def scrape_couponpromo(url):
+    """Return the store's codes from a couponpromo.net search page, from one request."""
+    html = fetch_html(url)
+    # Same company and codes as couponsgo.org, but full codes are in the page:
+    # <span data-domain="nobullproject.com"> ... data-clipboard-text="GOVX20", in that order within each result.
+    # Results for other stores are mixed in, so each code belongs to the last data-domain before it.
+    offers, domain = [], None
+    for match in re.finditer(r'data-domain="([^"]+)"|data-clipboard-text="([^"]+)"', html):
+        if match.group(1):
+            domain = match.group(1)
+        elif domain:
+            offers.append((domain, unescape(match.group(2)).strip()))
+    if not offers:
+        return []
+    store = Counter(domain for domain, _ in offers).most_common(1)[0][0]
+    return list(dict.fromkeys(code for domain, code in offers if domain == store and code))
+
+
+def scrape_kotag(url):
+    """Return all codes (active first, then expired) from a kotag /us/marques/codes-promo-{store}/ page."""
+    html = fetch_html(url)
+    # The store's influencer codes are in the Next.js data at
+    # props.pageProps.coupons = [{"code": "CHAMPAGNE45", "expired": false, ...}]
+    data = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.S)
+    if not data:
+        return []
+    coupons = json.loads(data.group(1)).get("props", {}).get("pageProps", {}).get("coupons") or []
+    coupons = [coupon for coupon in coupons if isinstance(coupon, dict) and (coupon.get("code") or "").strip()]
+    active = [coupon["code"].strip() for coupon in coupons if not coupon.get("expired")]
+    expired = [coupon["code"].strip() for coupon in coupons if coupon.get("expired")]
+    return list(dict.fromkeys(active + expired))
+
+
+def retailmenot_reveal(uuid):
+    """Return the full code from retailmenot's post-click modal for one offer, or None."""
+    body, status = get_response(f"https://www.retailmenot.com/modals/outclick/{uuid}/?template=merchant&trigger=entrance_modal")
+    if status != 200:
+        return None
+    try:
+        modal = json.loads(body).get("modalHtml") or ""
+    except ValueError:
+        return None
+    # The modal belongs to one offer and copies its code with navigator.clipboard.writeText('first25')
+    if f'data-content-uuid="{uuid}"' not in modal:
+        return None
+    code = re.search(r"navigator\.clipboard\.writeText\('([^']+)'\)", unescape(modal))
+    # Some offers hold a note instead of a code ("Code Provided with Signup"); real codes have no spaces
+    return code.group(1).strip() if code and " " not in code.group(1).strip() else None
+
+
+def scrape_retailmenot(url):
+    """Return the store's codes (active first, then expired) from a retailmenot /view/{domain} page."""
+    html = unescape(fetch_html(url))
+    # Each offer link is <a href="/out/O/<uuid>?...module=...&offer_uuid=<uuid>..." x-data="outclickHandler({...,
+    # 'offerType': 'COUPON', 'requestSlug': 'tommyjohn.com', 'offerUuid': '<uuid>'})">; expired offers have
+    # module=expired_offer. Clicking reloads the page with ?u=<uuid>, which loads the modal from
+    # /modals/outclick/<uuid>/ holding the code, so each code costs one extra request. /out/ links are never requested.
+    offers = re.findall(r"'offerType': 'COUPON', 'requestSlug': '([^']+)', 'offerUuid': '([A-Z0-9]+)'", html)
+    if not offers:
+        return []
+    store = Counter(slug for slug, _ in offers).most_common(1)[0][0]
+    uuids = list(dict.fromkeys(uuid for slug, uuid in offers if slug == store))
+    expired = set(re.findall(r"module=expired_offer[^\"]*offer_uuid=([A-Z0-9]+)", html))
+    uuids = [u for u in uuids if u not in expired] + [u for u in uuids if u in expired]
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        codes = list(pool.map(retailmenot_reveal, uuids))
+    return list(dict.fromkeys(code for code in codes if code))
+
+
+def offers_reveal(page, uuid):
+    """Return the full code from offers.com's code modal (?em=<uuid>), or None."""
+    html, status = get_response(f"{page}?em={uuid}")
+    # The modal renders as x-data="{ copiedButtonClicked: false, code: 'first25' }"
+    code = re.search(r"copiedButtonClicked: false, code: '([^']+)'", unescape(html)) if status == 200 else None
+    # Some offers hold a note instead of a code ("Code Provided with Signup"); real codes have no spaces
+    return code.group(1).strip() if code and " " not in code.group(1).strip() else None
+
+
+def scrape_offers(url):
+    """Return the store's codes from an offers.com /stores/{store}/ page."""
+    page = url.split("?")[0]
+    html = unescape(fetch_html(page))
+    # Code offers are links with x-data="commerceLink('<uuid>', '')" ... hasCode: true (deals say hasCode: false).
+    # Clicking opens the same page with ?em=<uuid>, which renders a modal holding the code, so each code costs one
+    # extra request. The /exit/outbound/ links go to the store and are never requested.
+    # (offers.com shares offer ids and codes with RetailMeNot.)
+    uuids = re.findall(r"commerceLink\('([A-Z0-9]+)'[^>]*hasCode: true", html)
+    uuids = list(dict.fromkeys(uuids))
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        codes = list(pool.map(lambda uuid: offers_reveal(page, uuid), uuids))
+    return list(dict.fromkeys(code for code in codes if code))
+
+
+def scrape_trustdeals(url):
+    """Return the codes shown on a trustdeals /view/{domain} page, from one request."""
+    html = fetch_html(url)
+    # Offers are <article class="coupon ..."> with <span class="code">. The store's own codes stay empty: their
+    # modal (?id=offer<id>) is also empty, and the code only shows after /api/jump/ (the store redirect), which is
+    # never requested. "coupon common" articles ("most common codewords at similar shops", e.g. SAVE10) are shown
+    # in full and count as codes, as agreed; "coupon expired" ones are skipped.
+    codes = re.findall(
+        r'<article[^>]*class="coupon (?!expired)[^"]*"(?:(?!</article>).)*?<span class="code">([^<]+)</span>', html, re.S
+    )
+    return list(dict.fromkeys(unescape(code).strip() for code in codes if code.strip()))
+
+
+def latestdeals_posts(path):
+    """Return the post objects from a latestdeals JSON API response, or [] if it fails."""
+    body, status = get_response(f"https://www.latestdeals.co.uk/api/{path}")
+    if status != 200:
+        return [], 0
+    try:
+        data = json.loads(body)
+    except ValueError:
+        return [], 0
+    if isinstance(data, list):  # /posts/expired-vouchers/ returns a plain list
+        return data, 1
+    posts = data.get("entities") or {}
+    return list(posts.values()) if isinstance(posts, dict) else posts, data.get("totalPages") or 1
+
+
+def scrape_latestdeals(url):
+    """Return the store's codes (active first, then expired) from latestdeals, via the site's own JSON API."""
+    # The store page sits behind an AWS WAF challenge and shows only each code's last 2 characters, but the
+    # page loads its offers from a JSON API that answers plain requests with full codes:
+    # /api/posts?merchantSlugDomain=<domain>&type=voucher&type=offer&page=N and /api/posts/expired-vouchers/<domain>
+    domain = url.split("?")[0].rstrip("/").split("/")[-1]
+    query = f"posts?merchantSlugDomain={domain}&type=voucher&type=offer&noExcerpts=true"
+    posts, pages = latestdeals_posts(query)
+    for page in range(2, pages + 1):
+        posts += latestdeals_posts(f"{query}&page={page}")[0]
+    expired, _ = latestdeals_posts(f"posts/expired-vouchers/{domain}")
+    offers = [(post.get("code") or "", post.get("merchantName")) for post in posts + expired if isinstance(post, dict)]
+    names = [name for _, name in offers if name]
+    store = Counter(names).most_common(1)[0][0] if names else None
+    return list(dict.fromkeys(code.strip() for code, name in offers if code.strip() and name in (store, None)))
+
+
+def scrape_troupon(url):
+    """Return the store's codes from a troupon {store}.troupon.com page, from one request."""
+    html = fetch_html(url)
+    # Codes look like data-coupon-code="HOMELIFE" data-coupon-url="https://cozyearth.com"; keep the most common store URL
+    offers = re.findall(r'data-coupon-code="([^"]+)" data-coupon-url="([^"]*)"', html)
+    if not offers:
+        return []
+    store = Counter(link for _, link in offers).most_common(1)[0][0]
+    return list(dict.fromkeys(unescape(code).strip() for code, link in offers if link == store and code.strip()))
+
+
+def scrape_couponupto(url):
+    """Return the store's codes from a couponupto /coupons/{store} page, from one request."""
+    page = url.split("?")[0].rstrip("/")
+    soup = BeautifulSoup(fetch_html(page), "html.parser")
+    # Code offers show the full code: <a class="get-deal-btn a_code" href=".../coupons/cozy-earth?..."><p id="code-...">.
+    # Codes of other stores are mixed in; their links point to those stores' pages.
+    codes = []
+    for element in soup.select('a.a_code p[id^="code-"]'):
+        link = element.find_parent("a").get("href", "").split("?")[0].rstrip("/")
+        if link == page:
+            codes.append(element.get_text(strip=True))
+    return list(dict.fromkeys(code for code in codes if code))
+
+
+def scrape_capitaloneshopping(url):
+    """Return the store's codes from a capitaloneshopping /s/{domain}/coupon page, from one request."""
+    html = unescape(fetch_html(url))
+    # Each code offer has a button aria-label="Copy code PANTS40 and open NOBULL in new tab"; deals say
+    # "No code required". Keep the most common store name in case other stores' offers show up.
+    offers = re.findall(r'aria-label="Copy code (.+?) and open (.+?) in new tab"', html)
+    if not offers:
+        return []
+    store = Counter(name for _, name in offers).most_common(1)[0][0]
+    return list(dict.fromkeys(code.strip() for code, name in offers if name == store and code.strip()))
+
+
+def scrape_shipthedeal(url):
+    """Return the store's codes from a shipthedeal /store/{store}-coupon page."""
+    html = fetch_html(url)
+    # A plain request sometimes gets a small waiting page that reloads itself after 5 seconds
+    if "window.location.reload()" in html and "_code" not in html:
+        response = client.get(url, params={"js_render": "true", "premium_proxy": "true", "wait": "5000"}, timeout=TIMEOUT)
+        html = response.text
+    # "Show Code" opens a modal filled from hidden elements on the page:
+    # id="getCode205108_code">WHOOPISNOBULL< and id="getCode205108_storename">NOBULL<
+    codes = dict(re.findall(r'id="getCode(\d+)_code"[^>]*>([^<]*)<', html))
+    stores = dict(re.findall(r'id="getCode(\d+)_storename"[^>]*>([^<]*)<', html))
+    names = [name.strip() for name in stores.values() if name.strip()]
+    store = Counter(names).most_common(1)[0][0] if names else None
+    # Deals hold a note like "(No Code Needed)" instead of a code; real codes have no spaces
+    return list(dict.fromkeys(
+        unescape(code).strip() for offer_id, code in codes.items()
+        if code.strip() and " " not in code.strip() and (stores.get(offer_id, "").strip() or None) in (store, None)
+    ))
+
+
+def lovecoupons_reveal(offer_id):
+    """Return the full code from lovecoupons' offer modal (/go/3/<id>), or None."""
+    html, status = get_response(f"https://www.lovecoupons.com/go/3/{offer_id}")
+    code = re.search(r'<input[^>]*id="coupon-[0-9a-f]+"[^>]*value="([^"]+)"', html) if status == 200 else None
+    return unescape(code.group(1)).strip() if code else None
+
+
+def scrape_lovecoupons(url):
+    """Return the store's codes from a lovecoupons /{store} page."""
+    page = url.split("?")[0].split("#")[0].rstrip("/")
+    html = fetch_html(page)
+    # Offers are <article class="Offer" data-id="..." data-type="2" data-brand-slug="/tommy-john">; the site's script
+    # treats types 2 and 17 as codes (3 is a sale, 9 shipping). Clicking opens the page with #r-<id>, which loads
+    # the modal from /go/3/<id> holding the code, so each code costs one extra request. /go/2/ is the store redirect
+    # and is never requested.
+    slug = "/" + page.split("/")[-1]
+    offers = re.findall(
+        r'<article class="Offer[^"]*"[^>]*data-id="([^"]+)"[^>]*data-type="(\d+)"[^>]*data-brand-slug="([^"]+)"', html
+    )
+    ids = list(dict.fromkeys(offer_id for offer_id, kind, brand in offers if kind in ("2", "17") and brand == slug))
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        codes = list(pool.map(lovecoupons_reveal, ids))
+    return list(dict.fromkeys(code for code in codes if code))
+
+
+def couponbox_reveal(voucher_id):
+    """Return the full code from couponbox's voucher API, or None."""
+    body, status = get_response(f"https://www.couponbox.com/api/voucher/{voucher_id}")
+    if status != 200:
+        return None
+    try:
+        code = (json.loads(body).get("code") or "").strip()
+    except ValueError:
+        return None
+    return code if code and " " not in code else None
+
+
+def scrape_couponbox(url):
+    """Return the store's codes (active first, then expired) from a couponbox /coupons/{store} page."""
+    html = fetch_html(url)
+    # The store's own offers are JSON in the Next.js payload: "activeVouchersGrouped":[[{...}]] and
+    # "expiredVouchers":[{...}]; offers further down belong to cross-sell stores. Code offers have
+    # "codeType":"copy_paste" but no code; the page's script gets it from /api/voucher/<id>, so each code costs
+    # one extra request.
+    chunks = re.findall(r'self\.__next_f\.push\(\[1,(".*?")\]\)</script>', html, re.S)
+    payload = "".join(json.loads(chunk) for chunk in chunks)
+    decoder = json.JSONDecoder()
+    vouchers = []
+    for key in ('"activeVouchersGrouped":', '"expiredVouchers":'):
+        start = payload.find(key)
+        if start == -1:
+            continue
+        data, _ = decoder.raw_decode(payload, start + len(key))
+        for item in data:
+            vouchers += item if isinstance(item, list) else [item]
+    ids = list(dict.fromkeys(
+        voucher["id"] for voucher in vouchers if isinstance(voucher, dict) and voucher.get("codeType") == "copy_paste"
+    ))
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        codes = list(pool.map(couponbox_reveal, ids))
+    # The same code is sometimes listed in different case ("DRLAURA" and "drlaura"); keep the first
+    unique = {}
+    for code in codes:
+        if code:
+            unique.setdefault(code.upper(), code)
+    return list(unique.values())
+
+
+def promopro_reveal(coupon_id, tail):
+    """Return the full code from promopro's coupon detail page, or None."""
+    html, status = get_response(f"https://www.promopro.com/coupon-codes/detail/{coupon_id}.html")
+    code = re.search(r'<div id="codeText">([^<]+)</div>', html) if status == 200 else None
+    if not code:
+        return None
+    code = unescape(code.group(1)).strip()
+    # The card shows the code's last characters ("ST15"); a mismatch means the page is for another offer
+    return code if code.upper().endswith(tail.upper()) else None
+
+
+def scrape_promopro(url):
+    """Return the store's codes from a promopro /coupon-codes/{store} page."""
+    html = fetch_html(url)
+    # Code offers are <article class="offer_card ... detail_filter_code"> showing only the code's tail in
+    # <div class="code">ST15</div>, with data-cid="5876670" on the link. Clicking opens the site's own
+    # /coupon-codes/detail/<cid>.html with the full code in <div id="codeText">, so each code costs one extra
+    # request. The /redirect/voucher/ link goes to the store and is never requested.
+    offers = []
+    for card in re.findall(r'<article class="offer_card[^"]*\bdetail_filter_code\b.*?</article>', html, re.S):
+        coupon_id = re.search(r'data-cid="(\d+)"', card)
+        tail = re.search(r'<div class="code">([^<]+)</div>', card)
+        # Some cards hold a note instead of a tail ("Learn How to Get Code at Tommy John")
+        if coupon_id and tail and tail.group(1).strip() and " " not in tail.group(1).strip():
+            offers.append((coupon_id.group(1), tail.group(1).strip()))
+    offers = list(dict.fromkeys(offers))
+    # Detail pages get blocked when many are requested at once, so fewer run in parallel than on other sites
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        codes = list(pool.map(lambda offer: promopro_reveal(*offer), offers))
+    return list(dict.fromkeys(code for code in codes if code))
+
+
+def scrape_rebatesme(url):
+    """Return the store's codes (active first, then expired) from a rebatesme /en/stores/{store} page."""
+    html = fetch_html(url)
+    # Offers are in `var couponListObj = [[{...}], ...]`; each offer has "merchantUrlName" and
+    # "couponCodeList":[{"code":"EARLY",...}] (empty for deals). The page's own store is `var urlNameInpage`.
+    data = re.search(r"var couponListObj = (.*?);\s*\n", html)
+    store = re.search(r'var urlNameInpage = "([^"]+)"', html)
+    if not data:
+        return []
+    offers = [offer for group in json.loads(data.group(1)) for offer in (group if isinstance(group, list) else [group])]
+    offers = [o for o in offers if isinstance(o, dict) and (not store or o.get("merchantUrlName") == store.group(1))]
+    offers.sort(key=lambda offer: bool(offer.get("expired")))
+    codes = [(item.get("code") or "").strip() for offer in offers for item in offer.get("couponCodeList") or []]
+    return list(dict.fromkeys(code for code in codes if code))
+
+
+def savings_reveal(popup_path):
+    """Return the full code from a savings.com coupon popup, or None."""
+    # Under load the popup sometimes redirects to the store page instead of blocking, so ask once more
+    for attempt in range(2):
+        html, status = get_response(f"https://www.savings.com{popup_path}")
+        code = re.search(r'<input class="code[^"]*"[^>]*value="([^"]+)"', html) if status == 200 else None
+        if code:
+            return unescape(code.group(1)).strip()
+        time.sleep(2)
     return None
 
 
-# Method 1: Try API endpoint
-def _try_coupert_api_method(url):
-    """
-    Fetch coupons from Coupert API endpoint.
-    Args: url (str) - Coupert store page URL
-    Returns: list - List of uppercase coupon codes
-    """
+def scrape_savings(url):
+    """Return the store's codes from a savings.com /coupons/{domain} page."""
+    html = fetch_html(url)
+    # Code offers are <div class="module-deal ... hasCode ..." data-provider-name="DHGate"> holding
+    # <input name="property-popup-url" value="/popup/detail/coupon-10911475.html">; that popup has the full code in
+    # <input class="code ..." value="...">, so each code costs one extra request. Sponsored offers of other brands
+    # are mixed in, so keep the most common provider.
+    offers = re.findall(
+        r'class="module-deal [^"]*\bhasCode\b[^"]*"[^>]*data-provider-name="([^"]+)"[^>]*>\s*'
+        r'<input type="hidden" name="property-popup-url" value="([^"]+)"', html,
+    )
+    if not offers:
+        return []
+    store = Counter(name for name, _ in offers).most_common(1)[0][0]
+    popups = list(dict.fromkeys(popup for name, popup in offers if name == store))
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        codes = list(pool.map(savings_reveal, popups))
+    return list(dict.fromkeys(code for code in codes if code))
+
+
+def fetch_past_challenge(url):
+    """fetch_html, but small WordPress sites sometimes answer with a "One moment, please..." challenge page first;
+    a JS-rendered request gets past it."""
+    html = fetch_html(url)
+    if "<title>One moment, please...</title>" in html:
+        response = client.get(url, params={"js_render": "true", "premium_proxy": "true", "wait": "5000"}, timeout=TIMEOUT)
+        html = response.text
+    return html
+
+
+def scrape_savingheist(url):
+    """Return the store's codes from a savingheist /store/{store}/ page, from one request."""
+    html = fetch_past_challenge(url)
+    # Code buttons look like <button ... data-coupon-id="205324" data-code="BULKRATE">Get Code</button>
+    codes = re.findall(r'data-coupon-id="\d+" data-code="([^"]+)"', html)
+    return list(dict.fromkeys(unescape(code).strip() for code in codes if code.strip()))
+
+
+def scrape_coupongrouphy(url):
+    """Return the store's codes from a coupongrouphy /dealstore/{store}/ page, from one request."""
+    html = fetch_past_challenge(url)
+    # Code offers are <span class="... masked_coupon" data-clipboard-text="JULIANASPICOLUK0" ...>
+    codes = re.findall(r'masked_coupon[^"]*" data-clipboard-text="([^"]+)"', html)
+    return list(dict.fromkeys(unescape(code).strip() for code in codes if code.strip()))
+
+
+def _gocashback_codes(html):
+    soup = BeautifulSoup(html, "html.parser")
+    # www.gocashback.com/stores/{store}: <div class="coupon-code">... <span class="coupon-text">FRIEND</span>
+    # promo.gocashback.com/{country}/store/{store}: <div class="coupon-item item-code">... <span class="code-box">BOR25</span>
+    elements = soup.select(".coupon-code .coupon-text") + soup.select(".coupon-item .code-box")
+    codes = [element.get_text(strip=True) for element in elements]
+    return list(dict.fromkeys(code for code in codes if code and " " not in code))
+
+
+def scrape_gocashback(url):
+    """Return the store's codes from a gocashback store page. The promo.gocashback.com pages have the codes
+    in plain HTML; the www.gocashback.com /stores/ pages only show them after JS rendering."""
+    codes = _gocashback_codes(fetch_html(url))
+    if codes:
+        return codes
+    # The render sometimes returns the page before the coupons load, so render once more when nothing is found
+    for _ in range(2):
+        response = client.get(url, params={"js_render": "true", "premium_proxy": "true", "wait": "5000"}, timeout=TIMEOUT)
+        if response.status_code != 200:
+            raise RuntimeError(f"status {response.status_code}")
+        codes = _gocashback_codes(response.text)
+        if codes:
+            break
+    return codes
+
+
+def scrape_reediscount(url):
+    """Return the store's codes from a reediscount /{store}/ page, from one request."""
+    html = fetch_html(url)
+    # Code buttons look like <a rel="nofollow" data-code="SK20" data-store_info="453780">
+    codes = re.findall(r'<a rel="nofollow" data-code="([^"]+)" data-store_info=', html)
+    return list(dict.fromkeys(unescape(code).strip() for code in codes if code.strip()))
+
+
+def scrape_couponterra(url):
+    """Return the store's codes from a couponterra /coupons/{domain} page, from one request."""
+    html = fetch_html(url)
+    # Codes are in full: <div class="get-code getCodeBtn" data-coupon-id="1235" data-code="VORTEX15" ...>
+    codes = re.findall(r'data-coupon-id="\d+"\s+data-code="([^"]+)"', html)
+    return list(dict.fromkeys(unescape(code).strip() for code in codes if code.strip()))
+
+
+def scrape_couponskiss(url):
+    """Return the store's codes from a couponskiss {store}.couponskiss.com page, from one request."""
+    html = fetch_html(url)
+    # Unknown stores show the homepage (canonical www.couponskiss.com), which has other stores' codes
+    canonical = re.search(r'<link rel="canonical" href="([^"]+)"', html)
+    if not canonical or "www.couponskiss.com" in canonical.group(1):
+        return []
+    # Codes are in data-clipboard-text="WELCOMEBACK"; deals say "Click to Redeem"
+    codes = re.findall(r'data-clipboard-text="([^"]+)"', html)
+    return list(dict.fromkeys(
+        unescape(code).strip() for code in codes if code.strip() and code != "Click to Redeem" and " " not in code.strip()
+    ))
+
+
+def scrape_couponblender(url):
+    """Return the store's codes from a couponblender /{store}/ page, from one request."""
+    html = fetch_html(url)
+    # Unknown stores show the homepage (canonical "https://www.couponblender.com//")
+    canonical = re.search(r'<link rel="canonical" href="([^"]+)"', html)
+    if not canonical or canonical.group(1).rstrip("/").endswith("couponblender.com"):
+        return []
+    # Each offer shows only the code's tail but holds it in full, next to a link on the store's site:
+    # <input class="special_url" value="https://www.shopbop.com"> <div class="cr"> <input value="APP15" class="hidden_cv">
+    # Expired offers further down use <div class="cr cr-n cr_exp">. Keep the most common site domain.
+    offers = re.findall(
+        r'class="special_url" value="([^"]*)">\s*<div class="cr[^"]*">\s*<input type="hidden" value="([^"]+)" class="hidden_cv">',
+        html,
+    )
+    offers = [(re.sub(r"^www\.", "", re.sub(r"^https?://", "", site).split("/")[0]), code) for site, code in offers]
+    if not offers:
+        return []
+    store = Counter(site for site, _ in offers).most_common(1)[0][0]
+    return list(dict.fromkeys(unescape(code).strip() for site, code in offers if site == store and code.strip()))
+
+
+def scrape_xyzcodes(url):
+    """Return the store's codes from an xyzcodes /store/{store}/ page, from one request."""
+    html = fetch_past_challenge(url)
+    # WordPress "WP Coupons and Deals" plugin: <a data-type="code" data-coupon-id="13909" ...
+    # data-clipboard-text="Welcome10">; deals use data-type="deal"
+    codes = re.findall(r'<a data-type="code" data-coupon-id="\d+"[^>]*data-clipboard-text="([^"]+)"', html)
+    return list(dict.fromkeys(unescape(code).strip() for code in codes if code.strip()))
+
+
+def scrape_coponcodes(url):
+    """Return the store's codes from a coponcodes /store/{store}/ page, from one request."""
+    html = fetch_html(url)
+    # Each code is hidden in <span id="code-2505" hidden>BFCM2025</span>
+    codes = re.findall(r'<span id="code-\d+" hidden>([^<]+)</span>', html)
+    return list(dict.fromkeys(unescape(code).strip() for code in codes if code.strip()))
+
+
+def redeempromos_reveal(store_slug, cid):
+    """Return the full code of one redeempromos offer from the site's getcode API, or None."""
+    for attempt in range(len(ATTEMPTS)):
+        try:
+            response = client.post("https://redeempromos.com/welcome/getcode", data={"cid": cid, "grabit": 0}, timeout=TIMEOUT)
+        except requests.RequestException:
+            continue
+        if response.status_code == 200:
+            break
+    else:
+        return None
     try:
-        store_domain = url.split("/")[-1]
-        if not store_domain:
-            return []
-
-        api_url = f"https://www.coupert.com/api/v3/store/{store_domain}"
-
-        response = fetchRequest(api_url)
-        if response and response.status_code == 200:
-            data = response.json()
-
-            # Try different JSON structures
-            coupon_data = None
-            if "coupons" in data:
-                coupon_data = data["coupons"]
-            elif "data" in data and isinstance(data["data"], dict):
-                if "coupons" in data["data"]:
-                    coupon_data = data["data"]["coupons"]
-
-            # Extract coupon codes
-            coupons = []
-            if coupon_data:
-                for coupon in coupon_data:
-                    code = _extract_coupon_code(coupon)
-                    if code:
-                        coupons.append(code)
-            return coupons
-    except Exception as e:
-        logger.debug(f"Coupert API method failed for {url}: {e}")
-    return []
+        data = json.loads(response.text)
+    except ValueError:
+        return None
+    # The answer is [{"seourl":"nike","code":"SAVE20",...}]; unknown ids return 0. Some "Get Code" offers only
+    # hold a placeholder like "OFFER ACTIVATED", so anything with a space is not a code.
+    offer = data[0] if isinstance(data, list) and data and isinstance(data[0], dict) else {}
+    code = (offer.get("code") or "").strip()
+    return code if code and " " not in code and offer.get("seourl") == store_slug else None
 
 
-# Method 2: Extract from __NEXT_DATA__ (Next.js structure)
-def _try_coupert_next_data_method(soup):
-    """
-    Extract coupons from Next.js __NEXT_DATA__ script tag.
-    Args: soup (BeautifulSoup) - Parsed HTML page
-    Returns: list - List of uppercase coupon codes
-    """
+def scrape_redeempromos(url):
+    """Return the store's codes from a redeempromos /{store} page."""
+    page = url.split("?")[0].rstrip("/")
+    soup = BeautifulSoup(fetch_html(page), "html.parser")
+    # Code offers are <a class="btn-reveal-wrap" href=".../nike?offer=7040"><span class="btn-label">Get Code</span>;
+    # deals say "Get Deal". The page's script gets each code from POST /welcome/getcode (cid=<offer>), so each code
+    # costs one extra request.
+    cids = []
+    for button in soup.select("a.btn-reveal-wrap[href]"):
+        label = button.select_one("span.btn-label")
+        match = re.search(r"[?&]offer=(\d+)", button["href"])
+        if label and label.get_text(strip=True).lower() == "get code" and match:
+            cids.append(match.group(1))
+    slug = page.split("/")[-1]
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        codes = list(pool.map(lambda cid: redeempromos_reveal(slug, cid), dict.fromkeys(cids)))
+    return list(dict.fromkeys(code for code in codes if code))
+
+
+def scrape_rebates(url):
+    """Return the store's codes from a rebates.com /coupons/{domain} page, from one request."""
+    return rebates_codes(fetch_html(url), url.split("?")[0].rstrip("/").split("/")[-1])
+
+
+def rebates_codes(html, domain):
+    """Codes of one store from a rebates.com page. Also used by url.py to check links, so both agree."""
+    # Offers are JSON in the Next.js payload: {"title":...,"store":"macys.com",...,"code":"FRIEND","type":"coupon",...}.
+    # Offers of other stores are mixed in, so keep only the page's own domain.
+    chunks = re.findall(r'self\.__next_f\.push\(\[1,(".*?")\]\)</script>', html, re.S)
+    payload = "".join(json.loads(chunk) for chunk in chunks)
+    # Links inside an offer contain braces ("sid={rebates-shopperid}"), so each code is matched to the nearest
+    # "store" before it instead of parsing the object.
+    codes = []
+    # The two keys come in either order: "code":"FRIEND","type":"coupon" or "type":"coupon","code":"HONEY25OFF"
+    for match in re.finditer(r'"code":"([^"]*)","type":"coupon"|"type":"coupon","code":"([^"]*)"', payload):
+        stores = re.findall(r'"store":"([^"]+)"', payload[max(0, match.start() - 3000):match.start()])
+        if stores and stores[-1] == domain:
+            codes.append((match.group(1) or match.group(2) or "").strip())
+    return list(dict.fromkeys(code for code in codes if code and " " not in code))
+
+
+def _collect(scraper, links):
+    """Run one site's scraper over every link and return all codes found. A failed link is logged and skipped."""
     coupons = []
-    try:
-        next_data = soup.select_one("script#__NEXT_DATA__")
-        if not next_data:
-            return coupons
-
-        json_data = json.loads(next_data.string)
-        if "props" in json_data:
-            props = json_data["props"]
-            if "pageProps" in props:
-                pageProps = props["pageProps"]
-                if "storeInfo" in pageProps:
-                    storeInfo = pageProps["storeInfo"]
-                    if "data" in storeInfo and "coupons" in storeInfo["data"]:
-                        for item in storeInfo["data"]["coupons"]:
-                            code = _extract_coupon_code(item)
-                            if code:
-                                coupons.append(code)
-    except Exception as e:
-        logger.debug(f"Coupert __NEXT_DATA__ parsing failed: {e}")
-    return coupons
-
-
-# Method 3: Extract from __NUXT_DATA__ (Nuxt.js structure)
-def _try_coupert_nuxt_data_method(soup):
-    """
-    Extract coupons from Nuxt.js __NUXT_DATA__ script tag.
-    Args: soup (BeautifulSoup) - Parsed HTML page
-    Returns: list - List of uppercase coupon codes
-    """
-    coupons = []
-    try:
-        nuxt_data = soup.select_one("script#__NUXT_DATA__")
-        if not nuxt_data:
-            return coupons
-
-        json_data = json.loads(nuxt_data.string)
-        if isinstance(json_data, list) and len(json_data) > 0:
-            for item in json_data:
-                if isinstance(item, str):
-                    try:
-                        dataText = base64.b64decode(item).decode("utf-8")
-                        dataJson = json.loads(dataText)
-
-                        if "merchant_coupons" in dataJson:
-                            couponsItem = dataJson["merchant_coupons"]
-                            for itm in couponsItem:
-                                code = _extract_coupon_code(itm)
-                                if code:
-                                    coupons.append(code)
-                    except Exception:
-                        continue
-    except Exception as e:
-        logger.debug(f"Coupert __NUXT_DATA__ parsing failed: {e}")
-    return coupons
-
-
-# Method 4: Extract from script tags using regex
-def _try_coupert_script_regex_method(soup):
-    """
-    Extract coupons from script tags using regex patterns.
-    Args: soup (BeautifulSoup) - Parsed HTML page
-    Returns: list - List of uppercase coupon codes
-    """
-    coupons = []
-    try:
-        script_tags = soup.find_all("script")
-        for script in script_tags:
-            if not script.string:
-                continue
-
-            try:
-                # Look for JSON containing coupon codes
-                if "code" in script.string.lower() or "coupon" in script.string.lower():
-                    # Try to find JSON objects with code field
-                    matches = re.findall(
-                        r'"code"\s*:\s*"([A-Z0-9]{4,30})"', script.string, re.IGNORECASE
-                    )
-                    for code in matches:
-                        if 4 <= len(code) <= 30:
-                            coupons.append(code.upper())
-            except Exception:
-                continue
-    except Exception as e:
-        logger.debug(f"Coupert script regex method failed: {e}")
-    return coupons
-
-
-# Method 5: Extract from visible HTML elements
-def _try_coupert_html_elements_method(soup):
-    """
-    Extract coupons from visible HTML elements.
-    Args: soup (BeautifulSoup) - Parsed HTML page
-    Returns: list - List of uppercase coupon codes
-    """
-    coupons = []
-    try:
-        excluded_texts = {
-            "CODE",
-            "COPY",
-            "SAVE",
-            "DEAL",
-            "FREE",
-            "SHOP",
-            "GETCODE",
-            "GET",
-            "NOW",
-        }
-
-        code_elements = soup.find_all(
-            ["span", "div", "button", "input"],
-            class_=re.compile(r"code|coupon", re.IGNORECASE),
-        )
-        for element in code_elements:
-            text = element.get_text(strip=True)
-            # Filter for valid coupon code patterns
-            if text and re.match(r"^[A-Z0-9]{4,30}$", text):
-                # Exclude common false positives
-                if text not in excluded_texts:
-                    coupons.append(text.upper())
-    except Exception as e:
-        logger.debug(f"Coupert HTML elements method failed: {e}")
-    return coupons
+    for url in dict.fromkeys(link.strip() for link in links or [] if link and link.strip()):
+        try:
+            codes = scraper(url)
+            logger.info(f"{len(codes)} codes from {url}")
+            coupons.extend(codes)
+        except Exception as e:
+            logger.error(f"Error fetching {url}: {e}")
+    return list(dict.fromkeys(coupons))
 
 
 # Main function: fetch coupons from coupert
 def fetch_coupons_from_coupert(links):
-    """
-    Fetch coupons from Coupert using multiple extraction methods.
-    Args: links (list) - List of Coupert store page URLs
-    Returns: list - List of unique uppercase coupon codes
-    """
-    try:
-        if not links:
-            return []
-
-        urls = [link.strip() for link in links]  # remove whitespace
-        coupons = []
-
-        for url in urls:
-            try:
-                # Method 1: Try API endpoint (fastest)
-                api_coupons = _try_coupert_api_method(url)
-                if api_coupons:
-                    coupons.extend(api_coupons)
-                    # If API method succeeds, skip HTML methods for this URL
-                    continue
-
-                # Fetch HTML once for all HTML-based methods
-                html = getZenrowsResponse(url)
-                if not html:
-                    continue
-
-                soup = BeautifulSoup(html, "html.parser")
-
-                # Method 2: Try __NEXT_DATA__
-                next_data_coupons = _try_coupert_next_data_method(soup)
-                if next_data_coupons:
-                    coupons.extend(next_data_coupons)
-                    # If Next.js method succeeds, skip remaining methods for this URL
-                    continue
-
-                # Method 3: Try __NUXT_DATA__
-                nuxt_coupons = _try_coupert_nuxt_data_method(soup)
-                if nuxt_coupons:
-                    coupons.extend(nuxt_coupons)
-                    # If Nuxt.js method succeeds, skip remaining methods for this URL
-                    continue
-
-                # Method 4: Try script regex parsing
-                script_coupons = _try_coupert_script_regex_method(soup)
-                if script_coupons:
-                    coupons.extend(script_coupons)
-                    # If script method succeeds, skip remaining methods for this URL
-                    continue
-
-                # Method 5: Try HTML elements (fallback)
-                html_coupons = _try_coupert_html_elements_method(soup)
-                if html_coupons:
-                    coupons.extend(html_coupons)
-
-            except Exception as e:
-                logger.error(f"Error scraping coupert for {url}: {e}")
-                continue
-
-        # Return unique coupons after processing all URLs
-        unique_coupons = list(set(coupons))
-        if unique_coupons:
-            logger.info(f"Found {len(unique_coupons)} unique coupons from Coupert")
-        return unique_coupons
-
-    except Exception as e:
-        logger.error(f"Error coupert fetching: {e}")
-        return []
-
-
-# Helper function: Get bad words list for hotdeals
-def _get_hotdeals_bad_words():
-    """
-    Get list of excluded terms for hotdeals coupon extraction.
-    Returns: list - List of strings to exclude from coupon codes
-    """
-    return [
-        "HTML",
-        "UTF8",
-        "TRUE",
-        "FALSE",
-        "WIDTH",
-        "HEIGHT",
-        "DEALS",
-        "PROMO",
-        "DECEMBER",
-    ]
-
-
-# Method 1: Extract coupons from code:"..." pattern in HTML
-def _extract_hotdeals_nuxt_codes(html):
-    """
-    Extract coupon codes from code:"..." pattern in HTML.
-    Args: html (str) - Raw HTML content
-    Returns: list - List of uppercase coupon codes
-    """
-    coupons = []
-    try:
-        nuxt_codes = re.findall(r'code:"([^"]+)"', html)
-        for code in nuxt_codes:
-            if code and code.lower() != "none":
-                coupons.append(code.upper())
-    except Exception as e:
-        logger.debug(f"Hotdeals nuxt codes extraction failed: {e}")
-    return coupons
-
-
-# Method 2: Extract coupons from meta description
-def _extract_hotdeals_meta_description(soup):
-    """
-    Extract coupon codes from meta description tag.
-    Args: soup (BeautifulSoup) - Parsed HTML page
-    Returns: list - List of uppercase coupon codes
-    """
-    coupons = []
-    try:
-        meta_desc = soup.find("meta", {"name": "description"})
-        if meta_desc:
-            content = meta_desc.get("content", "")
-            matches = re.findall(r'"([^"]*)"', content)
-            for match in matches:
-                if 4 <= len(match) <= 15:
-                    coupons.append(match.upper())
-    except Exception as e:
-        logger.debug(f"Hotdeals meta description extraction failed: {e}")
-    return coupons
-
-
-# Method 3: Extract coupons using regex pattern matching
-def _extract_hotdeals_regex_pattern(html):
-    """
-    Extract coupon codes using regex pattern matching.
-    Args: html (str) - Raw HTML content
-    Returns: list - List of uppercase coupon codes
-    """
-    coupons = []
-    try:
-        pattern = r"\b[A-Z]{2,}[A-Z0-9]{2,}\b"
-        raw_matches = re.findall(pattern, html)
-        bad_words = _get_hotdeals_bad_words()
-
-        for code in raw_matches:
-            # Must not be all digits, have reasonable length, not in bad words, and have at least 2 letters
-            if not code.isdigit() and len(code) < 15 and code not in bad_words:
-                if sum(char.isalpha() for char in code) >= 2:
-                    coupons.append(code)
-    except Exception as e:
-        logger.debug(f"Hotdeals regex pattern extraction failed: {e}")
-    return coupons
+    return _collect(scrape_coupert, links)
 
 
 # Main function: fetch coupons from hotdeals
 def fetch_coupons_from_hotdeals(links):
-    """
-    Fetch coupons from HotDeals using multiple extraction methods.
-    Args: links (list) - List of HotDeals page URLs
-    Returns: list - List of unique uppercase coupon codes
-    """
-    try:
-        if not links:
-            return []
-
-        urls = [link.strip() for link in links]  # remove whitespace
-        coupons = []
-
-        for url in urls:
-            try:
-                html = getZenrowsResponse(url)
-                if not html:
-                    continue
-
-                # Method 1: Extract from code:"..." pattern
-                nuxt_coupons = _extract_hotdeals_nuxt_codes(html)
-                coupons.extend(nuxt_coupons)
-
-                # Method 2: Extract from meta description
-                soup = BeautifulSoup(html, "html.parser")
-                meta_coupons = _extract_hotdeals_meta_description(soup)
-                coupons.extend(meta_coupons)
-
-                # Method 3: Extract using regex pattern matching
-                regex_coupons = _extract_hotdeals_regex_pattern(html)
-                coupons.extend(regex_coupons)
-
-            except Exception as e:
-                logger.error(f"Error scraping HotDeals for {url}: {e}")
-                continue
-
-        # Return unique coupons after processing all URLs
-        unique_coupons = list(set(coupons))
-        if unique_coupons:
-            logger.info(f"Found {len(unique_coupons)} unique coupons from HotDeals")
-        return unique_coupons
-
-    except Exception as e:
-        logger.error(f"Error hotdeals fetching: {e}")
-        return []
+    return _collect(scrape_hotdeals, links)
 
 
 def fetch_coupons_from_slickdeals(links):
@@ -454,67 +1210,7 @@ def fetch_coupons_from_slickdeals(links):
 
 
 def fetch_coupons_from_capitalone(links):
-
-    if not links or not isinstance(links, list):
-        logger.info("No links provided or invalid format.")
-        return []
-
-    all_coupons = []
-    unique_urls = list(dict.fromkeys([url.strip() for url in links if url]))
-
-    for url in unique_urls:
-        try:
-            logger.info(f" Processing: {url}")
-            html = getZenrowsResponse(url)
-            if not html:
-                logger.info(f" Empty response from ZenRows for: {url}")
-                continue
-
-            soup = BeautifulSoup(html, "html.parser")
-
-            tag = soup.find(
-                "script", string=lambda t: t and "window.__remixContext" in t
-            )
-            if not tag:
-                logger.info(f" RemixContext tag not found for: {url}")
-                continue
-
-            script_txt = tag.string.strip() if tag.string else tag.text.strip()
-
-            match = re.search(r"({.*})", script_txt, re.DOTALL)
-            if not match:
-                logger.info(f" Regex failed for: {url}")
-                continue
-
-            data_dict = json.loads(match.group(1))
-            loader_data = data_dict.get("state", {}).get("loaderData", {})
-
-            store_route = loader_data.get("routes/__app/s.$store.coupon", {})
-
-            coupons_list = (
-                store_route.get("StorePage", {})
-                .get("site", {})
-                .get("couponsInfo", {})
-                .get("coupons", [])
-            )
-
-            current_site_coupons = 0
-            for item in coupons_list:
-                code = item.get("code")
-                if code:
-                    all_coupons.append(code.strip().upper())
-                    current_site_coupons += 1
-
-            logger.info(f" {current_site_coupons} coupons from this link.")
-
-        except json.JSONDecodeError:
-            logger.info(f" JSON Parse Error for: {url}")
-        except Exception as e:
-            logger.info(f" Unexpected Error for {url}: {str(e)}")
-
-    final_result = sorted(list(set(all_coupons)))
-    logger.info(f" Total Unique Coupons Found: {len(final_result)}")
-    return final_result
+    return _collect(scrape_capitaloneshopping, links)
 
 
 def fetch_coupons_from_rakuten(url):
@@ -548,39 +1244,7 @@ def fetch_coupons_from_rakuten(url):
 
 # fetch coupons from rebates
 def fetch_coupons_from_rebates(links):
-    """
-    Fetch coupons from Rebates by extracting data-code attributes.
-    Args: links (list) - List of Rebates page URLs
-    Returns: list - List of uppercase coupon codes
-    """
-    try:
-        if not links:
-            return []
-
-        urls = [link.strip() for link in links]  # remove whitespace
-        coupons = []
-        for url in urls:
-            html = getZenrowsResponse(url, js_render=True)
-            if not html:
-                continue
-            pattern = r'coupon[\\"]*\s*,\s*[\\"]*code[\\"]*\s*:\s*[\\"]*([^\\"]+)'
-            found_codes = re.findall(pattern, html)
-
-            for code in found_codes:
-                clean_code = code.strip()
-                if clean_code and clean_code.lower() not in [
-                    "null",
-                    "none",
-                    "undefined",
-                ]:
-                    if len(clean_code) < 30:
-                        coupons.append(clean_code.upper())
-
-        final_results = list(set(coupons))
-        return final_results
-    except Exception as e:
-        logger.error(f"Error rebates fetching {url}: {e}")
-        return []
+    return _collect(scrape_rebates, links)
 
 
 # Helper function to extract coupon code from offer object
@@ -870,55 +1534,7 @@ def _try_visible_elements_method(soup):
 
 
 def fetch_coupons_from_retailmenot(links):
-    coupons = []
-
-    if not links:
-        return []
-
-    for url in links:
-        logger.info(f"Scraping RetailMeNot: {url}")
-
-        html = getZenResponseAlter(url, js_render=True, isProxy=True)
-        if not html:
-            continue
-
-        soup = BeautifulSoup(html, "html.parser")
-        coupon_elements = soup.select('a[data-content-datastore="offer"]')
-
-        dynamic_ids = list(
-            set(
-                el.get("data-content-uuid")
-                for el in coupon_elements
-                if el.get("data-content-uuid")
-            )
-        )
-
-        eventReferenceId = "ee2f6e04-cbc5-4b53-b93c-fb0eb132fbf3"
-
-        for el in dynamic_ids:
-            page_url = (
-                f"{url}?u={el}&outclicked=true&eventReferenceId={eventReferenceId}"
-            )
-            logger.info("page url is", page_url)
-
-            html2 = getZenResponseAlter(page_url, js_render=True, isProxy=True)
-
-            if not html2:
-                continue
-
-            soup2 = BeautifulSoup(html2, "html.parser")
-            code_divs = soup2.select(
-                "div.relative.mb-2.flex.h-12.w-full.items-center.justify-center.overflow-hidden.rounded-3xl.bg-gray-100.text-base.font-bold.leading-none.tracking-wider.text-purple-700"
-            )
-
-            if code_divs:
-                for div in code_divs:
-                    code = div.get_text(strip=True)
-                    if code:
-                        coupons.append(code)
-                break
-
-    return list(set(code.upper() for code in coupons if code))
+    return _collect(scrape_retailmenot, links)
 
 
 # Main function: fetch coupons from retailmenot
@@ -987,33 +1603,7 @@ def fetch_coupons_from_retailmenot(links):
 
 # fetch coupons from joinhoney
 def fetch_coupons_from_joinhoney(links):
-    """
-    Fetch coupons from JoinHoney by selecting aria-label elements.
-    Args: links (list) - List of JoinHoney page URLs
-    Returns: list - List of uppercase coupon codes
-    """
-    try:
-        if not links:
-            return []
-
-        urls = [link.strip() for link in links]  # remove whitespace
-        coupons = []
-        for url in urls:
-            html = getZenrowsResponse(url, js_render=True)
-            if not html:
-                continue
-            soup = BeautifulSoup(html, "html.parser")
-
-            coupon_elements = soup.select('[aria-label="Coupon Code"]')
-            for element in coupon_elements:
-                coupon = element.text.strip()
-                if coupon:
-                    coupons.append(coupon.upper())
-
-        return coupons
-    except Exception as e:
-        logger.error(f"Error joinhoney fetching {url}: {e}")
-        return []
+    return _collect(scrape_joinhoney, links)
 
 
 # fetch coupons from dealcatcher
@@ -1093,56 +1683,8 @@ def fetch_coupons_from_dealcatcher(links):
 #         logger.error(f'Error dontpayfull fetching {url}: {e}')
 #         return []
 async def fetch_coupons_from_dontpayfull(links):
-    """
-    Fetch coupons from DontPayFull using async methods and modal extraction.
-    Args: links (list) - List of DontPayFull page URLs
-    Returns: list - List of unique uppercase coupon codes
-    """
-    coupons = []
-    try:
-        if not links:
-            return []
-
-        # remove whitespace
-        urls = [link.strip() for link in links]
-        client = zenrowsClient()
-        responses = await asyncio.gather(*[fetch_page(client, url) for url in urls])
-
-        coupon_elements = []
-        coupon_urls = []
-        for response in responses:
-            if response:
-                html = response  # fetch_page already returns the text content
-                soup = BeautifulSoup(html, "html.parser")
-                coupon_elements = soup.select('.card.obox.code[data-otype="code"]')
-                for element in coupon_elements:
-                    idAttribute = element.get_attribute_list("data-id")[0]
-                    classAttribute = element.get_attribute_list("class")[0]
-                    if "sponsored" not in classAttribute:
-                        coupon_urls.append(
-                            f"https://www.dontpayfull.com/coupons/getcoupon?id={idAttribute}"
-                        )
-        try:
-            responses = await asyncio.gather(
-                *[fetch_page(client, url) for url in coupon_urls]
-            )
-
-            for response in responses:
-                html2 = response  # fetch_page already returns the text content
-                soup2 = BeautifulSoup(html2, "html.parser")
-
-                coupon_elements2 = soup2.select(".code-box.code h2")
-                for element2 in coupon_elements2:
-                    code = element2.text.strip()
-                    if code is not None:
-                        coupons.append(code.upper())
-        except Exception as e:
-            logger.error(f"Error dontpayfull fetching {coupon_urls}: {e}")
-            return []
-        return list(set(coupons))
-    except Exception as e:
-        logger.error(f"Error dontpayfull fetching {links}: {e}")
-        return []
+    # The scraper blocks, so it runs in a worker thread to keep the event loop free
+    return await asyncio.to_thread(_collect, scrape_dontpayfull, links)
 
 
 # fetch coupons from vaouchercodes
@@ -1262,66 +1804,8 @@ async def fetch_coupons_from_couponbirds(links):
 
 
 async def fetch_coupons_from_offers(links):
-    """
-    Fetch coupons from Offers.com using async methods and modal extraction.
-    Args: links (list) - List of Offers.com page URLs
-    Returns: list - List of unique uppercase coupon codes
-    """
-    coupons = []
-    try:
-        if not links:
-            return []
-
-        # remove whitespace
-        urls = [link.strip() for link in links]
-        coupon_urls = []
-        client = zenrowsClient()
-        responses = await asyncio.gather(*[fetch_page(client, url) for url in urls])
-
-        for url in urls:
-            for response in responses:
-                if response:
-                    html = response  # fetch_page already returns the text content
-                    soup = BeautifulSoup(html, "html.parser")
-                    elements1 = soup.select(
-                        '[data-offer-id] > [data-content-datastore="offer"]'
-                    )
-
-            for element in elements1:
-                attribute1 = element.get_attribute_list("x-data")[0]
-                attribute2 = element.get_attribute_list("@click.prevent")[0]
-
-                if attribute1:
-                    offerId = attribute1.split("'")[1]
-                    hasCode = "hasCode: true" in attribute2
-                    if hasCode:
-                        coupon_urls.append(f"{url}?em={offerId}")
-
-            try:
-                logger.info(f"coupon_urls: {coupon_urls}")
-                responses = await asyncio.gather(
-                    *[fetch_page(client, url) for url in coupon_urls]
-                )
-                # print(f'responses: {responses}')
-
-                for response in responses:
-                    html2 = response  # fetch_page already returns the text content
-                    soup2 = BeautifulSoup(html2, "html.parser")
-                    elements2 = soup2.select('[x-data="commerceModal"] [x-data]')
-                    for element2 in elements2:
-                        codeAttribute = element2.get_attribute_list("x-data")[0]
-                        coupon = codeAttribute.split("'")[3]
-                        if coupon is not None:
-                            coupons.append(coupon.upper())
-            except Exception as e:
-                logger.error(f"Error fetching coupon from offers: {e}")
-                continue
-
-        return list(set(coupons))
-
-    except Exception as e:
-        logger.error(f"Error offers fetching {links}: {e}")
-        return []
+    # The scraper blocks, so it runs in a worker thread to keep the event loop free
+    return await asyncio.to_thread(_collect, scrape_offers, links)
 
 
 # def fetch_coupons_from_offers(links):
@@ -1441,62 +1925,7 @@ def fetch_coupons_from_couponcode(url):
 
 
 def fetch_coupons_from_coupons(url):
-    """
-    Fetch coupons from Coupons.com using API calls with client ID extraction.
-    Args: url (list) - List of Coupons.com page URLs
-    Returns: list - List of uppercase coupon codes
-    """
-    try:
-        if not url:
-            return []
-
-        urls = [link.strip() for link in url]  # remove whitespace
-        coupons = []
-        for url in urls:
-            html = getZenrowsResponse(url)
-            if not html:
-                continue
-
-            soup = BeautifulSoup(html, "html.parser")
-            styleElements = soup.select('[type="text/css"]')
-            clientId = None
-            for styleElement in styleElements:
-                href = styleElement.get("href")
-                if (
-                    href
-                    and "https://www.coupons.com/assets/pico" in href
-                    and "style-guide.css" in href
-                ):
-                    clientId = href.split("pico/")[1].split("/")[0]
-                    break
-
-            if clientId:
-                coupon_elements = soup.select('[data-attribute="code"]')
-                for element in coupon_elements:
-                    couponId = element.get_attribute_list("data-id")
-
-                    if len(couponId) == 0:
-                        continue
-                    try:
-                        text = getZenrowsResponse(
-                            f"https://www.coupons.com/api/voucher/country/us/client/{clientId}/id/{couponId[0]}"
-                        )
-                        if text:
-                            data = json.loads(text)
-                            if "type" in data and data["type"] == "code":
-                                code = data["code"]
-                                if code:
-                                    coupons.append(code.upper())
-
-                    except Exception as e:
-                        logger.error(
-                            f"[fetch_coupons_from_coupons] Error scraping coupons: {e}"
-                        )
-                        continue
-        return coupons
-    except Exception as e:
-        logger.error(f"Error coupons fetching {url}: {e}")
-        return []
+    return _collect(scrape_coupons, url)
 
 
 def fetch_coupons_from_karma(links):
@@ -1531,78 +1960,11 @@ def fetch_coupons_from_karma(links):
 
 
 def fetch_coupons_from_simplycodes(links):
-    """
-    Fetch coupons from SimplyCodes using API endpoint.
-    Args: links (list) - List of SimplyCodes page URLs
-    Returns: list - List of uppercase coupon codes
-    """
-    try:
-        if not links:
-            return []
-
-        urls = [link.strip() for link in links]  # remove whitespace
-        coupons = []
-        for link in urls:
-            url = f'https://simplycodes.com/api/promotion/mdp/codes?slug={link.split("/")[-1]}&filter=all&showFallback=true&extras=detailsCombined'
-            response = getZenrowsResponse(url, js_render=True)
-            jsondata = json.loads(response)
-
-            if "promotions" in jsondata:
-                promotions = jsondata["promotions"]
-                for promo in promotions:
-
-                    if promo.get("isCode") == True and "code" in promo:
-                        code = promo["code"].upper().strip()
-                        if code:
-                            coupons.append(code)
-
-        return coupons
-
-    except Exception as e:
-        logger.error(f"Error simplycodes fetching {urls}: {e}")
-        return []
+    return _collect(scrape_simplycodes, links)
 
 
 def fetch_coupons_from_savings(links):
-    """
-    Fetch coupons from Savings.com using async methods and popup extraction.
-    Args: links (list) - List of Savings.com page URLs
-    Returns: list - List of unique uppercase coupon codes
-    """
-    coupons = []
-    try:
-        if not links:
-            return []
-        urls = [link.strip() for link in links]  # remove whitespace
-
-        for url in urls:
-            html = getZenrowsResponse(url, js_render=True)
-            if not html:
-                continue
-            soup = BeautifulSoup(html, "html.parser")
-            coupon_elements = soup.select(
-                ".module-deal.showValue.codePeek[data-offer-id]"
-            )
-            for element in coupon_elements:
-                attribute = element.get("id")
-                if not attribute:
-                    continue
-                couponId = attribute.split("-")[-1]
-                html2 = getZenrowsResponse(
-                    f"https://www.savings.com/popup/detail/coupon-{couponId}.html",
-                    js_render=True,
-                )
-
-                soup2 = BeautifulSoup(html2, "html.parser")
-                coupon_elements2 = soup2.select_one("input.code.code-border[value]")
-                if coupon_elements2:
-                    code = coupon_elements2.get("value")
-                    coupons.append(code)
-
-        return list(set(coupons))
-    except Exception as e:
-        logger.error(f"Error savings fetching {links}: {e}")
-        return []
+    return _collect(scrape_savings, links)
 
 
 # def fetch_coupons_from_savings(links):
@@ -1673,403 +2035,36 @@ def fetch_coupons_from_dealspotr(links):
 
 
 def fetch_coupons_from_promocodes(links):
-    """
-    Fetch coupons from PromoCodes by parsing __NEXT_DATA__ and regex.
-    Args: links (list) - List of PromoCodes page URLs
-    Returns: list - List of filtered uppercase coupon codes
-    """
-    try:
-        if not links:
-            return []
-
-        urls = [link.strip() for link in links]  # remove whitespace
-        coupons = []
-
-        for url in urls:
-            try:
-                html = getZenrowsResponse(url, js_render=True)
-                if not html:
-                    continue
-
-                soup = BeautifulSoup(html, "html.parser")
-                next_data_script = soup.select_one("script#__NEXT_DATA__")
-
-                if next_data_script:
-                    json_data = json.loads(next_data_script.string)
-
-                    def find_coupons(obj):
-                        if isinstance(obj, dict):
-                            for k, v in obj.items():
-                                if k == "couponCode" and v:
-                                    coupons.append(v.upper())
-                                else:
-                                    find_coupons(v)
-                        elif isinstance(obj, list):
-                            for item in obj:
-                                find_coupons(item)
-
-                    find_coupons(json_data)
-
-                regex_codes = re.findall(r'"couponCode"\s*:\s*"([^"]+)"', html)
-                coupons.extend([c.upper() for c in regex_codes if c])
-            except Exception as e:
-                logger.error(f"Error")
-
-        final_coupons = list(set(coupons))
-
-        garbage = ["NULL", "NONE", "VERIFIED", "TRUE", "FALSE"]
-        final_coupons = [c for c in final_coupons if c not in garbage and len(c) > 2]
-        return final_coupons
-    except Exception as e:
-        logger.error(f"Error promocodes fetching {e}")
-        return []
+    return _collect(scrape_promocodes, links)
 
 
 def fetch_coupons_from_couponchief(links):
-    """
-    Fetch coupons from CouponChief using overlay extraction.
-    Args: links (list) - List of CouponChief page URLs
-    Returns: list - List of uppercase coupon codes
-    """
-    try:
-        if not links:
-            return []
-
-        urls = [link.strip() for link in links]
-        coupons = []
-
-        for url in urls:
-            html = getZenrowsResponse(url)
-            if not html:
-                continue
-
-            soup = BeautifulSoup(html, "html.parser")
-            coupon_elements = soup.select(".coupon-code-container.store-code")
-
-            for element in coupon_elements:
-                attribute = element.get_attribute_list("id")
-                if len(attribute) == 0:
-                    continue
-
-                try:
-                    couponId = attribute[0].split("-")[-1]
-                    html2 = getZenrowsResponse(
-                        f"https://www.couponchief.com/pages/coupon_overlay/{couponId}"
-                    )
-                    soup2 = BeautifulSoup(html2, "html.parser")
-                    coupon_elements2 = soup2.select("input#coupon-code")
-
-                    for element2 in coupon_elements2:
-                        coupon = element2.get("value")
-                        if coupon:
-                            coupons.append(coupon.upper())
-
-                except Exception as e:
-                    logger.error(f"Error scraping Couponchief overlay: {e}")
-                    continue
-
-        unique_coupons = list(set(coupons))
-        logger.info(f"Found {len(unique_coupons)} unique coupons from CouponChief")
-        return unique_coupons
-
-    except Exception as e:
-        logger.error(f"Error couponchief fetching: {e}")
-        return []
+    return _collect(scrape_couponchief, links)
 
 
 def fetch_coupons_from_goodshop(links):
-    """
-    Fetch coupons from GoodShop by extracting data-clipboard-text attributes.
-    """
-    try:
-        if not links:
-            return []
-
-        urls = [link.strip() for link in links]
-        coupons = []
-
-        for url in urls:
-            html = getZenrowsResponse(url)
-            if not html:
-                continue
-
-            soup = BeautifulSoup(html, "html.parser")
-            coupon_elements = soup.select("[data-clipboard-text]")
-
-            for element in coupon_elements:
-                code = element.get_attribute_list("data-clipboard-text")[0]
-                if code:
-                    coupons.append(code)
-
-        return list(set(coupons))
-
-    except Exception as e:
-        logger.error(f"Error goodshop fetching {e}")
-        return []
-
-
-# Helper function: Validate coupon code format
-def _is_valid_tenereteam_code(code):
-    """
-    Check if code matches Tenereteam coupon format.
-    Args: code (str) - Code to validate
-    Returns: bool - True if valid format, False otherwise
-    """
-    if not code:
-        return False
-    return code.isupper() and 3 <= len(code) <= 15 and " " not in code
-
-
-# Method 1: Extract coupons from strong tags
-def _extract_tenereteam_strong_tags(soup):
-    """
-    Extract coupon codes from strong tags.
-    Args: soup (BeautifulSoup) - Parsed HTML page
-    Returns: list - List of uppercase coupon codes
-    """
-    coupons = []
-    try:
-        for strong_tag in soup.find_all("strong"):
-            code = strong_tag.get_text(strip=True)
-            if _is_valid_tenereteam_code(code):
-                coupons.append(code)
-    except Exception as e:
-        logger.debug(f"Tenereteam strong tags extraction failed: {e}")
-    return coupons
-
-
-# Method 2: Extract coupons from input elements
-def _extract_tenereteam_input_elements(soup):
-    """
-    Extract coupon codes from input elements with values.
-    Args: soup (BeautifulSoup) - Parsed HTML page
-    Returns: list - List of uppercase coupon codes
-    """
-    coupons = []
-    try:
-        for box in soup.find_all("input", value=True):
-            val = box["value"].strip()
-            if _is_valid_tenereteam_code(val):
-                coupons.append(val)
-    except Exception as e:
-        logger.debug(f"Tenereteam input elements extraction failed: {e}")
-    return coupons
-
-
-# Method 3: Extract coupons from button/div elements with code/coupon classes
-def _extract_tenereteam_button_div_elements(soup):
-    """
-    Extract coupon codes from button/div elements with code/coupon classes.
-    Args: soup (BeautifulSoup) - Parsed HTML page
-    Returns: list - List of uppercase coupon codes
-    """
-    coupons = []
-    try:
-        for btn in soup.find_all(
-            ["button", "div"], class_=re.compile(r"code|coupon", re.I)
-        ):
-            btn_text = btn.get_text(strip=True)
-            if _is_valid_tenereteam_code(btn_text):
-                coupons.append(btn_text)
-    except Exception as e:
-        logger.debug(f"Tenereteam button/div elements extraction failed: {e}")
-    return coupons
+    return _collect(scrape_goodshop, links)
 
 
 # Main function: fetch coupons from tenereteam
 def fetch_coupons_from_tenereteam(links):
-    """
-    Fetch coupons from Tenereteam using multiple extraction methods.
-    Args: links (list) - List of Tenereteam page URLs
-    Returns: list - List of unique uppercase coupon codes
-    """
-    try:
-        if not links:
-            return []
-
-        urls = [link.strip() for link in links]  # remove whitespace
-        coupons = []
-
-        for url in urls:
-            try:
-                html = getZenrowsResponse(url)
-                if not html:
-                    continue
-                soup = BeautifulSoup(html, "html.parser")
-                scripts = soup.find_all("script")
-                for s in scripts:
-                    txt = s.get_text(strip=True)
-                    if "__next_f.push" not in txt:
-                        continue
-
-                    matches = re.findall(r'\\"coupon_code\\"\s*:\s*\\"([^"]+)\\"', txt)
-
-                    for code in matches:
-                        coupons.append(code)
-
-            except Exception as e:
-                logger.error(f"Error scraping tenereteam for {url}: {e}")
-                continue
-
-        # Return unique coupons after processing all URLs
-        unique_coupons = list(set(coupons))
-        if unique_coupons:
-            logger.info(f"Found {len(unique_coupons)} unique coupons from Tenereteam")
-        return unique_coupons
-
-    except Exception as e:
-        logger.error(f"Error tenereteam fetching: {e}")
-        return []
+    return _collect(scrape_tenereteam, links)
 
 
 def fetch_coupons_from_couponcause(links):
-    """
-    Fetch coupons from CouponCause by selecting div elements.
-    Args: links (list) - List of CouponCause page URLs
-    Returns: list - List of uppercase coupon codes
-    """
-    try:
-        if not links:
-            return []
-
-        urls = [link.strip() for link in links]  # remove whitespace
-        coupons = []
-
-        for url in urls:
-            html = getZenrowsResponse(url)
-            if not html:
-                continue
-
-            soup = BeautifulSoup(html, "html.parser")
-            selector = "div.bg-grey-lighter.border.border-grey-lighter.text-grey-dark.text-right"
-            coupon_elements = soup.select(selector)
-            for element in coupon_elements:
-                code = element.get_text(strip=True)
-                code = code.replace("Show Code", "").strip()
-                if code and code != "Get Offer" and len(code) > 0:
-                    coupons.append(code)
-
-        final_coupons = list(set(coupons))
-        return final_coupons
-    except Exception as e:
-        logger.error(f"Error couponcause fetching {e}")
-        return []
+    return _collect(scrape_couponcause, links)
 
 
 def fetch_coupons_from_goodsearch(links):
-    """
-    Fetch coupons from GoodSearch by parsing __NEXT_DATA__.
-    Args: links (list) - List of GoodSearch page URLs
-    Returns: list - List of uppercase coupon codes
-    """
-    try:
-        if not links:
-            return []
-
-        urls = [link.strip() for link in links]  # remove whitespace
-
-        coupons = []
-
-        for url in urls:
-            html = getZenrowsResponse(url)
-            if not html:
-                continue
-
-            soup = BeautifulSoup(html, "html.parser")
-            next_data = soup.select_one("script#__NEXT_DATA__")
-            if next_data:
-                json_data = json.loads(next_data.string)
-                if "props" in json_data:
-                    props = json_data["props"]
-                    if "pageProps" in props:
-                        pageProps = props["pageProps"]
-                        if "merchant" in pageProps:
-                            deals = pageProps["merchant"]
-                            if "activeDeals" in deals:
-                                for item in deals["activeDeals"]:
-                                    coupon = item["code"]
-                                    if coupon:
-                                        coupons.append(coupon.upper())
-        return coupons
-    except Exception as e:
-        logger.error(f"Error goodsearch fetching {e}")
-        return []
+    return _collect(scrape_goodsearch, links)
 
 
 def fetch_coupons_from_valuecom(links):
-    """
-    Fetch coupons from Value.com by selecting button code elements.
-    Args: links (list) - List of Value.com page URLs
-    Returns: list - List of uppercase coupon codes
-    """
-    try:
-        if not links:
-            return []
-
-        urls = [link.strip() for link in links]  # remove whitespace
-        coupons = []
-        for url in urls:
-            html = getZenrowsResponse(url, js_render=True)
-            if not html:
-                continue
-
-            soup = BeautifulSoup(html, "html.parser")
-            coupon_elements = soup.select("button.btn-code .code-text")
-            for element in coupon_elements:
-                code = element.text.strip()
-                # need to check the code is not made up with special characters only like "****" or "$$$$$"
-                if code and not re.match(r"^[\*\s\.\-]+$", code):
-                    coupons.append(code.upper())
-
-        return coupons
-    except Exception as e:
-        logger.error(f"Error valuecom fetching {e}")
-        return []
+    return _collect(scrape_valuecom, links)
 
 
 def fetch_coupons_from_lovecoupons(links):
-    """
-    Fetch coupons from LoveCoupons using modal extraction.
-    Args: links (list) - List of LoveCoupons page URLs
-    Returns: list - List of uppercase coupon codes
-    """
-    try:
-        if not links:
-            return []
-        urls = [link.strip() for link in links]  # remove whitespace
-        coupons = []
-
-        for url in urls:
-            html = getZenrowsResponse(url)
-            if not html:
-                continue
-
-            soup = BeautifulSoup(html, "html.parser")
-            coupon_elements = soup.select('article.Offer[data-type="2"]')
-            for element in coupon_elements:
-                attribute = element.get_attribute_list("data-id")
-                if len(attribute) == 0:
-                    continue
-                try:
-                    html2 = getZenrowsResponse(
-                        f"https://www.lovecoupons.com/go/3/{attribute[0]}"
-                    )
-                    soup2 = BeautifulSoup(html2, "html.parser")
-                    coupon_elements2 = soup2.select(".RevealCoupon input.block")
-
-                    for element2 in coupon_elements2:
-                        coupon = element2.get("value")
-                        if coupon:
-                            coupons.append(coupon.upper())
-
-                except Exception as e:
-                    logger.error(f"Error scraping lovecoupons: {e}")
-                    continue
-
-        return coupons
-    except Exception as e:
-        logger.error(f"Error lovecoupons fetching {e}")
-        return []
+    return _collect(scrape_lovecoupons, links)
 
 
 def fetch_coupons_from_knoji(links):
@@ -2265,368 +2260,24 @@ def fetch_coupons_from_joinsmarty(links):
 
 
 def fetch_coupons_from_rebatesme(links):
-    """
-    Fetch coupons from RebatesMe using API POST request.
-    Args: links (list) - List of RebatesMe API URLs with merchant IDs
-    Returns: list - List of uppercase coupon codes
-    """
-    try:
-        if not links:
-            return []
-
-        urls = [link.strip() for link in links]  # remove whitespace
-
-        coupons = []
-        for url in urls:
-            apiUrl = url.split("?")[0]
-            merchantId = url.split("=")[1]
-
-            data = {
-                "pageNo": 1,
-                "pageSize": 1000,
-                "merchantId": merchantId,
-            }
-
-            text, status = postZenrowsResponse(apiUrl, data=json.dumps(data))
-            if text:
-                entity = json.loads(text)
-                if "data" in entity:
-                    data = entity["data"]
-                    if "coupons" in data:
-                        items = data["coupons"]
-                        for item in items:
-                            if "couponCodeList" in item:
-                                codes = item["couponCodeList"]
-                                for code in codes:
-                                    if "code" in code:
-                                        coupon = code["code"]
-                                        if coupon:
-                                            coupons.append(coupon.upper())
-        return coupons
-    except Exception as e:
-        logger.error(f"Error rebatesme fetching {e}")
-        return []
+    return _collect(scrape_rebatesme, links)
 
 
 def fetch_coupons_from_refermate(links):
-    """
-    Fetch coupons from ReferMate by extracting data-clipboard-text.
-    Args: links (list) - List of ReferMate page URLs
-    Returns: list - List of uppercase coupon codes
-    """
-    try:
-        if not links:
-            return []
-
-        urls = [link.strip() for link in links]  # remove whitespace
-        coupons = []
-        for url in urls:
-            html = getZenrowsResponse(url, js_render=True)
-            if not html:
-                continue
-            matches = re.findall(r'\\"couponCode\\":\\"([^"]+)\\"', html)
-            coupons.extend(matches)
-
-        return list(set(coupons))
-    except Exception as e:
-        logger.error(f"Error refermate fetching {e}")
-        return []
+    return _collect(scrape_refermate, links)
 
 
 def fetch_coupons_from_discountreactor(links):
-    """
-    Fetch coupons from DiscountReactor by extracting data-code attributes.
-    Args: links (list) - List of DiscountReactor page URLs
-    Returns: list - List of uppercase coupon codes
-    """
-    try:
-        if not links:
-            return []
-        urls = [link.strip() for link in links]  # remove whitespace
-        coupons = []
-        for url in urls:
-            html = getZenrowsResponse(url, js_render=True)
-            if not html:
-                continue
-
-            soup = BeautifulSoup(html, "html.parser")
-            coupon_elements = soup.select(".offer-list-item-button_hidden-code")
-            for element in coupon_elements:
-                code = element.get_attribute_list("data-code")
-                if len(code) == 0:
-                    continue
-                coupons.append(code[0].strip().upper())
-
-        return coupons
-    except Exception as e:
-        logger.error(f"Error discountreactor fetching {e}")
-        return []
-
-
-def is_valid_coupon(code: str) -> bool:
-    code = code.strip()
-
-    if len(code) < 4 or len(code) > 20:
-        return False
-
-    if " " in code:
-        return False
-
-    blacklist = {
-        "sign",
-        "receive",
-        "discount",
-        "shop",
-        "email",
-        "activate",
-        "deal",
-        "save",
-    }
-
-    lowered = code.lower()
-    return not any(word in lowered for word in blacklist)
+    return _collect(scrape_discountreactor, links)
 
 
 def fetch_coupons_from_couponbox(links):
-    """
-    Fetch coupons from CouponBox using voucher API.
-    Args:
-        links (list): List of CouponBox page URLs
-    Returns:
-        list: List of valid uppercase coupon codes
-    """
-
-    if not links:
-        return []
-
-    coupons = []
-    urls = [link.strip() for link in links]
-
-    for url in urls:
-        try:
-            html = getZenrowsResponse(url, js_render=True)
-            if not html:
-                continue
-
-            soup = BeautifulSoup(html, "html.parser")
-            voucher_elements = soup.select(
-                '[data-testid="VouchersListItem"][class*="VouchersListItem_root_type-voucher"]'
-            )
-
-            for element in voucher_elements:
-                voucher_ids = element.get_attribute_list("data-voucherid")
-                if not voucher_ids:
-                    continue
-
-                api_url = f"https://www.couponbox.com/api/voucher/{voucher_ids[0]}"
-                response = getZenrowsResponse(api_url)
-                if not response:
-                    continue
-
-                data = json.loads(response)
-                code = data.get("code")
-
-                if (
-                    data.get("codeType") == "copy_paste"
-                    and code
-                    and is_valid_coupon(code)
-                ):
-                    coupons.append(code.strip().upper())
-
-        except Exception as e:
-            logger.error(f"Error fetching CouponBox data from {url}: {e}")
-
-    return list(set(coupons))
-
-
-# Helper function: Get exclude list for dealdrop
-def _get_dealdrop_exclude_list():
-    """
-    Get list of excluded terms for dealdrop coupon extraction.
-    Returns: list - List of strings to exclude from coupon codes
-    """
-    return [
-        "FFFFFF",
-        "ABOUT",
-        "CONTACT",
-        "DEAL",
-        "DROP",
-        "HTML",
-        "SVELTE",
-        "TRUE",
-        "FALSE",
-        "NULL",
-        "WIDTH",
-        "HEIGHT",
-        "LOGO",
-        "IMAGE",
-        "UTF8",
-        "DECEMBER",
-        "VIEWPORT",
-    ]
-
-
-# Method 1: Extract coupons using regex pattern matching
-def _extract_dealdrop_regex_coupons(html_content):
-    """
-    Extract coupons from HTML content using regex pattern matching.
-    Args: html_content (str) - Raw HTML content
-    Returns: list - List of uppercase coupon codes
-    """
-    coupons = []
-    try:
-        pattern = r"\b[A-Z]{3,10}[0-9]{0,4}\b"
-        raw_matches = re.findall(pattern, html_content)
-        exclude_list = _get_dealdrop_exclude_list()
-
-        for code in raw_matches:
-            if code not in exclude_list and len(code) >= 4:
-                # Must have digits or be at least 5 characters
-                if any(char.isdigit() for char in code) or len(code) >= 5:
-                    if code.upper() not in coupons:
-                        coupons.append(code.upper())
-    except Exception as e:
-        logger.debug(f"Dealdrop regex extraction failed: {e}")
-    return coupons
-
-
-# Method 2: Extract coupons from script tags
-def _extract_dealdrop_script_coupons(soup):
-    """
-    Extract coupons from script tags containing specific keywords.
-    Args: soup (BeautifulSoup) - Parsed HTML page
-    Returns: list - List of uppercase coupon codes
-    """
-    coupons = []
-    try:
-        exclude_list = _get_dealdrop_exclude_list()
-        scripts = soup.find_all("script")
-
-        for script in scripts:
-            if script.string and (
-                "HALLMARK" in script.string or "WANDER" in script.string
-            ):
-                matches = re.findall(r'"([A-Z0-9]{4,15})"', script.string)
-                for match in matches:
-                    if match not in exclude_list and match not in coupons:
-                        coupons.append(match)
-    except Exception as e:
-        logger.debug(f"Dealdrop script extraction failed: {e}")
-    return coupons
-
-
-# Method 3: Extract expected coupon codes
-def _extract_dealdrop_expected_coupons(html_content):
-    """
-    Extract known expected coupon codes from HTML content.
-    Args: html_content (str) - Raw HTML content
-    Returns: list - List of uppercase coupon codes
-    """
-    coupons = []
-    try:
-        expected_codes = [
-            "HALLMARK20",
-            "CARLOSANDHEATH20",
-            "WANDER25",
-            "NUD10",
-            "CARE25",
-            "MATT20",
-        ]
-
-        for expected in expected_codes:
-            if expected in html_content and expected not in coupons:
-                coupons.append(expected)
-    except Exception as e:
-        logger.debug(f"Dealdrop expected codes extraction failed: {e}")
-    return coupons
+    return _collect(scrape_couponbox, links)
 
 
 # Main function: fetch coupons from dealdrop
 def fetch_coupons_from_dealdrop(links):
-    """
-    Fetch coupons from DealDrop using multiple extraction methods.
-    Args: links (list) - List of DealDrop page URLs
-    Returns: list - List of unique uppercase coupon codes
-    """
-    try:
-        if not links:
-            return []
-
-        urls = [link.strip() for link in links]  # remove whitespace
-        coupons_list = []
-
-        for url in urls:
-            try:
-                html_content = getZenrowsResponse(url)
-                if not html_content:
-                    continue
-
-                pattern = r"\b[A-Z]{3,10}[0-9]{0,4}\b"
-                raw_matches = re.findall(pattern, html_content)
-                exclude_list = [
-                    "FFFFFF",
-                    "ABOUT",
-                    "CONTACT" "DEAL",
-                    "DROP",
-                    "HTML",
-                    "SVELTE",
-                    "TRUE",
-                    "FALSE",
-                    "NULL",
-                    "WIDTH",
-                    "HEIGHT",
-                    "LOGO",
-                    "IMAGE",
-                    "UTF8",
-                    "DECEMBER",
-                    "VIEWPORT",
-                ]
-
-                for code in raw_matches:
-                    if code not in exclude_list and len(code) >= 4:
-                        if any(char.isdigit() for char in code) or len(code) >= 5:
-                            if code not in coupons_list:
-                                coupons_list.append(code.upper())
-
-                # Method 2: Script tag parsing
-                soup = BeautifulSoup(html_content, "html.parser")
-                scripts = soup.find_all("script")
-
-                for script in scripts:
-                    if script.string and (
-                        "HALLMARK" in script.string or "WANDER" in script.string
-                    ):
-
-                        matches = re.findall(r'"([A-Z0-9]{4,15})"', script.string)
-                        for m in matches:
-                            if m not in exclude_list and m not in coupons_list:
-                                coupons_list.append(m)
-                expected_codes = [
-                    "HALLMARK20",
-                    "CARLOSANDHEATH20",
-                    "WANDER25",
-                    "NUD10",
-                    "CARE25",
-                    "MATT20",
-                ]
-
-                for expected in expected_codes:
-                    if expected in html_content and expected not in coupons_list:
-                        coupons_list.append(expected)
-
-            except Exception as e:
-                logger.error(f"Error scraping dealdrop for {url}: {e}")
-                continue
-
-        # Return unique coupons after processing all URLs
-        unique_coupons = list(set(coupons_list))
-        if unique_coupons:
-            logger.info(f"Found {len(unique_coupons)} unique coupons from DealDrop")
-        return unique_coupons
-
-    except Exception as e:
-        logger.error(f"Error dealdrop fetching: {e}")
-        return []
+    return _collect(scrape_dealdrop, links)
 
 
 def fetch_coupons_from_revounts(links):
@@ -2662,64 +2313,7 @@ def fetch_coupons_from_revounts(links):
 
 
 def fetch_coupons_from_dazzdeals(links):
-    """
-    Fetch coupons from DazzDeals using modal extraction with coupon IDs.
-    Args: links (list) - List of DazzDeals page URLs
-    Returns: list - List of uppercase coupon codes
-    """
-    all_coupons = []
-
-    try:
-        if not links:
-            return []
-
-        urls = [link.strip() for link in links]
-
-        for url in urls:
-            cp_values = []
-
-            html = getZenResponseAlter(url, js_render=True, isProxy=True)
-            if not html:
-                logger.warning(f"Failed to fetch DazzDeals page: {url}")
-                continue
-
-            soup = BeautifulSoup(html, "html.parser")
-            elements = soup.select("[data-cp]")
-
-            for el in elements:
-                cp = el.get("data-cp")
-                if cp:
-                    cp_values.append(cp)
-
-            unique_cp_values = list(set(cp_values))
-            logger.info(f"Found {len(unique_cp_values)} unique cp values for {url}")
-            for cp in unique_cp_values:
-                try:
-                    cp_url = f"{url}/?cp={cp}"
-                    html2 = getZenResponseAlter(cp_url, js_render=True, isProxy=True)
-
-                    if not html2:
-                        continue
-
-                    soup2 = BeautifulSoup(html2, "html.parser")
-                    code_div = soup2.find("div", id="ccode")
-
-                    if code_div:
-                        code = code_div.get_text(strip=True)
-                        if code:
-                            all_coupons.append(code.upper())
-
-                except Exception as e:
-                    logger.error(f"Error fetching cp modal {cp} from {url}: {e}")
-                    continue
-
-        unique_coupons = list(set(all_coupons))
-        logger.info(f"Total unique coupons from DazzDeals: {len(unique_coupons)}")
-        return unique_coupons
-
-    except Exception as e:
-        logger.error(f"Error dazzdeals fetching: {e}")
-        return []
+    return _collect(scrape_dazzdeals, links)
 
 
 def fetch_coupons_from_heydiscount(links):
@@ -2773,447 +2367,40 @@ def fetch_coupons_from_heydiscount(links):
 
 
 def fetch_coupons_from_couponbind(links):
-    """
-    Fetch coupons from CouponBind using cookies and proxy.
-    Args: links (list) - List of CouponBind page URLs
-    Returns: list - List of uppercase coupon codes
-    """
-    try:
-        if not links:
-            return []
-
-        urls = [link.strip() for link in links]  # remove whitespace
-        coupons = []
-        for url in urls:
-            html = getZenrowsResponse(url)
-            if not html:
-                continue
-
-            soup = BeautifulSoup(html, "html.parser")
-            coupon_elements = soup.select(".item-code .hiddenCode")
-
-            for element in coupon_elements:
-                code = element.text.strip()
-                if code is not None:
-                    coupons.append(code.upper())
-
-        return coupons
-    except Exception as e:
-        logger.error(f"Error couponbind fetching {e}")
-        return []
+    return _collect(scrape_couponbind, links)
 
 
 def fetch_coupons_from_promopro(links):
-    """
-    Fetch coupons from PromoPro by selecting button code elements.
-    """
-    all_final_coupons = []
-
-    try:
-        if not links:
-            return []
-
-        urls = [link.strip() for link in links]
-
-        for url in urls:
-            promo_ids = []
-            parsed = urlparse(url)
-            path_parts = parsed.path.strip("/").split("/")
-            if len(path_parts) < 2:
-                logger.warning(f"Invalid URL structure for: {url}")
-                continue
-
-            store_slug = path_parts[-1]
-            html = getZenrowsResponse(url, js_render=True)
-            if not html:
-                continue
-
-            soup = BeautifulSoup(html, "html.parser")
-            articles = soup.find_all(
-                "article", class_="offer_card detail_filter_all detail_filter_code"
-            )
-
-            for art in articles:
-                a_tag = art.find("a", class_="go_crd crd", attrs={"data-cid": True})
-                if a_tag:
-                    promo_ids.append(a_tag["data-cid"])
-
-            for pid in promo_ids:
-                promo_url = (
-                    f"https://www.promopro.com/coupon-codes/{store_slug}?promoid={pid}"
-                )
-                p_html = getZenrowsResponse(promo_url, js_render=True)
-
-                if not p_html:
-                    continue
-
-                p_soup = BeautifulSoup(p_html, "html.parser")
-                code_div = p_soup.find("div", id="codeText")
-
-                if code_div:
-                    code = code_div.get_text(strip=True)
-                    if code:
-                        all_final_coupons.append(code)
-
-        unique_coupons = list(dict.fromkeys(all_final_coupons))
-        logger.info(f"Total unique coupons found: {len(unique_coupons)}")
-        return unique_coupons
-
-    except Exception as e:
-        logger.error(f"Error in fetch_coupons_from_promopro: {e}")
-        return []
-
-
-# Method 1: Extract coupons from data-clipboard-text attribute
-def _extract_greenpromocode_clipboard_coupons(soup):
-    """
-    Extract coupon codes from elements with data-clipboard-text attribute.
-    Args: soup (BeautifulSoup) - Parsed HTML page
-    Returns: list - List of uppercase coupon codes
-    """
-    coupons = []
-    try:
-        coupon_elements = soup.select(".code[data-clipboard-text]")
-        for element in coupon_elements:
-            code = element.get("data-clipboard-text")
-            if code:
-                clean_code = code.strip().upper()
-                if clean_code:
-                    coupons.append(clean_code)
-    except Exception as e:
-        logger.debug(f"Greenpromocode clipboard extraction failed: {e}")
-    return coupons
-
-
-# Method 2: Extract coupons from description elements using regex
-def _extract_greenpromocode_description_coupons(soup):
-    """
-    Extract coupon codes from description elements using regex pattern.
-    Args: soup (BeautifulSoup) - Parsed HTML page
-    Returns: list - List of uppercase coupon codes
-    """
-    coupons = []
-    try:
-        desc_elements = soup.select(".description")
-        for desc in desc_elements:
-            # Match text within quotes (various quote styles)
-            match = re.search(r'[""\'\'](.*?)[""\'\']', desc.get_text())
-            if match:
-                code = match.group(1).strip().upper()
-                if code:
-                    coupons.append(code)
-    except Exception as e:
-        logger.debug(f"Greenpromocode description extraction failed: {e}")
-    return coupons
+    return _collect(scrape_promopro, links)
 
 
 # Main function: fetch coupons from greenpromocode
 def fetch_coupons_from_greenpromocode(links):
-    """
-    Fetch coupons from GreenPromoCode using multiple extraction methods.
-    Args: links (list) - List of GreenPromoCode page URLs
-    Returns: list - List of unique uppercase coupon codes
-    """
-    try:
-        if not links:
-            return []
-
-        urls = [link.strip() for link in links]  # remove whitespace
-        coupons = []
-
-        for url in urls:
-            try:
-                html = getZenrowsResponse(url, isProxy=True)
-                if not html:
-                    continue
-
-                soup = BeautifulSoup(html, "html.parser")
-                desc_elements = soup.select(".description")
-                for desc in desc_elements:
-                    match = re.search(r'[“"\'\'](.*?)[”"\'\']', desc.get_text())
-                    if match:
-                        coupons.append(match.group(1).strip().upper())
-
-            except Exception as e:
-                logger.error(f"Error scraping greenpromocode for {url}: {e}")
-                continue
-
-        # Return unique coupons after processing all URLs
-        unique_coupons = list(set(coupons))
-        if unique_coupons:
-            logger.info(
-                f"Found {len(unique_coupons)} unique coupons from GreenPromoCode"
-            )
-        return unique_coupons
-
-    except Exception as e:
-        logger.error(f"Error greenpromocode fetching: {e}")
-        return []
+    return _collect(scrape_greenpromocode, links)
 
 
 def fetch_coupons_from_deala(links):
-    """
-    Fetch coupons from DealA by parsing serverApp-state JSON data.
-    Args: links (list) - List of DealA page URLs
-    Returns: list - List of uppercase coupon codes
-    """
-    try:
-        if not links:
-            return []
-
-        urls = [link.strip() for link in links]  # remove whitespace
-        coupons = []
-        for url in urls:
-            html = getZenrowsResponse(url, js_render=True)
-            if not html:
-                continue
-
-            soup = BeautifulSoup(html, "html.parser")
-            coupon_elements = soup.select("#serverApp-state")
-
-        for element in coupon_elements:
-            text = element.text.strip()
-            if text is not None:
-                textData = unescape(text)
-                decoded = textData.replace("&q;", '"')
-                data = {}
-                try:
-                    data = json.loads(decoded)
-                except json.JSONDecodeError as e:
-                    logger.error(f"[fetch_coupons_from_deala]Error scraping: {e}")
-
-                if "store-view-page-coupons-highlight" in data:
-                    jsonData = data["store-view-page-coupons-highlight"]
-                    if "result" in jsonData:
-                        if "data" in jsonData["result"]:
-                            items = jsonData["result"]["data"]
-                            for item in items:
-                                if "code" in item:
-                                    code = item["code"]
-                                    if code:
-                                        coupons.append(code.upper())
-                if "store-view-page-coupons-other" in data:
-                    jsonData = data["store-view-page-coupons-other"]
-                    if "result" in jsonData:
-                        if "data" in jsonData["result"]:
-                            items = jsonData["result"]["data"]
-                            for item in items:
-                                if "code" in item:
-                                    code = item["code"]
-                                    if code:
-                                        coupons.append(code.upper())
-
-        return coupons
-    except Exception as e:
-        logger.error(f"Error dealA fetching {e}")
-        return []
+    return _collect(scrape_deala, links)
 
 
 def fetch_coupons_from_troupon(links):
-    """
-    Fetch coupons from Troupon pages.
-    Args:
-        links (list): List of Troupon page URLs
-    Returns:
-        list: List of uppercase coupon codes
-    """
-
-    if not links:
-        return []
-
-    coupons = []
-    urls = [link.strip() for link in links]
-
-    for url in urls:
-        try:
-            html = getZenrowsResponse(url, js_render=True)
-            if not html:
-                continue
-
-            soup = BeautifulSoup(html, "html.parser")
-            page_coupons = []
-
-            # Primary selector (itemprop)
-            elements = soup.find_all(attrs={"itemprop": "couponCode"})
-            for el in elements:
-                code = el.get_text(strip=True)
-                if code and len(code) < 20:
-                    page_coupons.append(code.upper())
-
-            # Fallback selector
-            if not page_coupons:
-                fallback_elements = soup.select("span.coupon-code")
-                for el in fallback_elements:
-                    code = el.get_text(strip=True)
-                    if code:
-                        page_coupons.append(code.upper())
-
-            coupons.extend(page_coupons)
-
-        except Exception as e:
-            logger.error(f"Error fetching Troupon data from {url}: {e}")
-
-    return list(set(coupons))
+    return _collect(scrape_troupon, links)
 
 
 def fetch_coupons_from_worthepenny(links):
-    """
-    Fetch coupons from WorthEPenny using cookies and proxy with data-code extraction.
-    Args: links (list) - List of WorthEPenny page URLs
-    Returns: list - List of uppercase coupon codes ..
-    """
-    coupons = []
-    try:
-        if not links:
-            return []
-
-        urls = [link.strip() for link in links]  # remove whitespace
-        for url in urls:
-            html = getZenrowsResponse(
-                url,
-                js_render=True,
-            )
-            if not html:
-                continue
-
-            soup = BeautifulSoup(html, "html.parser")
-            elements = soup.find_all(attrs={"data-code": True})
-            for el in elements:
-                code = el.get("data-code").strip()
-                if code and code.lower() != "none":
-                    coupons.append(code.upper())
-
-        return coupons
-    except Exception as e:
-        logger.error(f"Error worthepenny fetching {e}")
-        return coupons
-    finally:
-        return coupons
+    return _collect(scrape_worthepenny, links)
 
 
 def fetch_coupons_from_savingheist(links):
-    coupons = []
-
-    if not links:
-        return coupons
-
-    for url in [link.strip() for link in links]:
-        try:
-            html = getZenrowsResponse(url, js_render=True)
-            if not html:
-                continue
-
-            soup = BeautifulSoup(html, "html.parser")
-            json_scripts = soup.find_all("script", type="application/ld+json")
-
-            for script in json_scripts:
-                try:
-                    data = json.loads(script.string)
-                    if data.get("@type") == "ItemList":
-                        for item_wrapper in data.get("itemListElement", []):
-                            code = item_wrapper.get("item", {}).get("identifier")
-                            if code:
-                                coupons.append(code.strip().upper())
-                except:
-                    continue
-
-        except Exception as e:
-            logger.error(f"Error savingheist fetching {url}: {e}")
-
-    return coupons
+    return _collect(scrape_savingheist, links)
 
 
 def fetch_coupons_from_coupongrouphy(links):
-    """
-    Fetch coupons from CouponGroupHy using cookies and proxy with data-clipboard-text.
-    Args: links (list) - List of CouponGroupHy page URLs
-    Returns: list - List of uppercase coupon codes
-    """
-    coupons = []
-    try:
-        if not links:
-            return []
-
-        urls = [link.strip() for link in links]  # remove whitespace
-        coupons = []
-        for url in urls:
-            try:
-                html = getZenrowsResponse(url, js_render=True)
-                if not html:
-                    continue
-
-                soup = BeautifulSoup(html, "html.parser")
-                elements = soup.find_all(attrs={"data-clipboard-text": True})
-
-                for el in elements:
-                    code = el["data-clipboard-text"].strip()
-                    if code:
-                        coupons.append(code.upper())
-
-                if not coupons:
-                    for item in soup.select(".masked_code, .coupon_code"):
-                        coupons.append(item.get_text(strip=True).upper())
-            except Exception as e:
-                logger.error(f"Error coupongrouphy fetching {url}: {e}")
-                continue
-
-        return coupons
-    except Exception as e:
-        logger.error(f"Error coupongrouphy fetching {e}")
-        return coupons
-
-    finally:
-        return coupons
+    return _collect(scrape_coupongrouphy, links)
 
 
 def fetch_coupons_from_joincheckmate(links):
-    """
-    Fetch coupons from JoinCheckmate using modal extraction with code IDs.
-    Args: links (list) - List of JoinCheckmate page URLs
-    Returns: list - List of uppercase coupon codes
-    """
-    coupons = []
-    try:
-        if not links:
-            return []
-
-        urls = [link.strip() for link in links]  # remove whitespace
-        for url in urls:
-            html = getZenrowsResponse(url, js_render=True)
-            if not html:
-                continue
-            raw_ids = re.findall(r'"id":"(01[a-zA-Z0-9]{20,})"', html)
-
-            unique_ids = []
-            for i in raw_ids:
-                if i not in unique_ids:
-                    unique_ids.append(i)
-
-            logger.info(
-                f"Found {len(unique_ids)} potential IDs. Now fetching values..."
-            )
-
-            for cid in unique_ids:
-                try:
-                    modal_url = f"{url}/modal?code={cid}"
-                    modal_html = getZenrowsResponse(modal_url, js_render=True)
-                    code_match = re.search(
-                        r'"selectedCode":\{.*?"value":"([^"]+)"', modal_html
-                    )
-
-                    if code_match:
-                        found_code = code_match.group(1)
-                        if "#" not in found_code:
-                            coupons.append(found_code)
-
-                except Exception as e:
-                    logger.error(f"Error fetching modal for {cid}: {e}")
-                    continue
-
-        return coupons
-    except Exception as e:
-        logger.error(f"Error joincheckmate fetching {e}")
-        return []
+    return _collect(scrape_joincheckmate, links)
 
 
 def fetch_coupons_from_faircoupons(links):
@@ -3262,92 +2449,10 @@ def fetch_coupons_from_faircoupons(links):
 
     
 def fetch_coupons_from_dealam(links):
-    try:
-        if not links:
-            return []
-
-        coupon_codes = []
-
-        session = requests.Session()
-        session.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.5",
-            "Referer": "https://www.google.com",
-            "Connection": "keep-alive",
-        })
-        session.cookies.set("browser_source", "chrome", domain=".dealam.com")
-        session.cookies.set("dealam_request_id", "964486544", domain=".dealam.com")
-
-        for url in links:
-            logger.info("URL:", url)
-
-            response = session.get(url, timeout=20)
-            if not response.ok:
-                logger.info(f"DealAM bad status {response.status_code} for {url}")
-                continue
-
-            html = response.text
-            if not html:
-                continue
-
-            soup = BeautifulSoup(html, "html.parser")
-            elements = soup.select("span[data-clipboard-text]")
-            for el in elements:
-                code = el.get("data-clipboard-text", "").strip()
-                if code:
-                    coupon_codes.append(code.upper())
-
-        unique = list(set(coupon_codes))
-        logger.info(f"Found {len(unique)} unique coupons from DealAM")
-        return unique
-
-    except Exception as e:
-        logger.error("Error:", e)
-        return []
+    return _collect(scrape_dealam, links)
 
 def fetch_coupons_from_coponcodes(links):
-    """
-    Fetch coupons from CouponCodes using direct request.
-    Codes are in: <span id="code-NNNN" hidden>COUPONCODE</span>
-    """
-    try:
-        if not links:
-            return []
-
-        coupon_codes = []
-
-        session = requests.Session()
-        session.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.5",
-            "Referer": "https://www.google.com",
-            "Connection": "keep-alive",
-        })
-
-        for url in links:
-            logger.info("URL:", url)
-
-            response = session.get(url, timeout=20)
-            if not response.ok:
-                logger.info(f"CouponCodes bad status {response.status_code} for {url}")
-                continue
-
-            soup = BeautifulSoup(response.text, "html.parser")
-            spans = soup.find_all("span", id=re.compile(r"^code-\d+$"))
-            for span in spans:
-                code = span.get_text(strip=True)
-                if code:
-                    coupon_codes.append(code.upper())
-
-        unique = list(set(coupon_codes))
-        logger.info(f"Found {len(unique)} unique coupons from CouponCodes")
-        return unique
-
-    except Exception as e:
-        logger.error("Error:", e)
-        return []       
+    return _collect(scrape_coponcodes, links)
     
 def fetch_coupons_from_zensavings(links):
    
@@ -3389,556 +2494,60 @@ def fetch_coupons_from_zensavings(links):
         
 
 def fetch_coupons_from_kotag(links):
-    try:
-        if not links:
-            return []
-
-        coupon_codes = []
-
-        for url in links:
-            logger.info("URL:", url)
-
-            html = getZenrowsWithCookiesResponse(url,isProxy=True)
-            if not html:
-                continue
-            
-            codes = re.findall(r'"code"\s*:\s*"([^"]+)"', html)
-
-            for code in codes:
-                coupon_codes.append(code)
-
-        return list(set(coupon_codes))
-
-    except Exception as e:
-        logger.error("exception:", e)
-        return []
+    return _collect(scrape_kotag, links)
     
 def fetch_coupons_from_xyzcodes(links):
-    try:
-        if not links:
-            return []
-
-        coupon_codes = set() 
-
-        for url in links:
-            logger.info("URL:", url)
-            html = getZenrowsWithCookiesResponse(url,  isProxy=True)
-            if not html:
-                continue
-
-            codes = re.findall(r'data-clipboard-text="([^"]+)"', html)
-
-            for code in codes:
-                if code:
-                    coupon_codes.add(code.strip())
-
-        return list(coupon_codes)
-
-    except Exception as e:
-        logger.error("exception:", e)
-        return []
+    return _collect(scrape_xyzcodes, links)
     
     
 def fetch_coupons_from_couponblender(links):
-    try:
-        if not links:
-            return []
-
-        coupon_codes = []
-        
-        for url in links:
-            logger.info("URL:", url)
-            html = getZenrowsWithCookiesResponse(url, isProxy=True)
-
-            soup = BeautifulSoup(html, "html.parser")
-            elements = soup.select("input.hidden_cv")
-            for el in elements:
-                code = el.get("value", "").strip()
-                if code:
-                    coupon_codes.append(code.upper())
-
-        unique = list(set(coupon_codes))
-        logger.info(f"Found {len(unique)} unique coupons from CouponBlender")
-        return unique
-
-    except Exception as e:
-        logger.error("exception:", e)
-        return []
+    return _collect(scrape_couponblender, links)
 
 
 def fetch_coupons_from_couponpromo(links):
-    try:
-        if not links:
-            return []
-
-        coupon_codes = set()
-
-        for url in links:
-            logger.info("URL:", url)
-
-            html = getZenrowsWithCookiesResponse(url,  isProxy=True)
-            if not html:
-                continue
-
-            soup = BeautifulSoup(html, "html.parser")
-            inputs = soup.select('input[name="c-c"]')
-
-            for inp in inputs:
-                code = inp.get("value")
-                if code:
-                    coupon_codes.add(code.strip())
-
-        return list(coupon_codes)
-
-    except Exception as e:
-        logger.error("exception:", e)
-        return [] 
+    return _collect(scrape_couponpromo, links)
     
 def fetch_coupons_from_shipthedeal(links):
-    try:
-        if not links:
-            return []
-
-        coupon_codes = set()
-
-        for url in links:
-            logger.info("URL:", url)
-
-            html = getZenrowsWithCookiesResponse(url,isProxy=True)
-            if not html:
-                continue
-
-            soup = BeautifulSoup(html, "html.parser")
-            spans = soup.select("span.hidden[id$='_code']")
-
-            for sp in spans:
-                code = sp.get_text(strip=True)
-
-                if not code:
-                    continue
-       
-                if "no code" in code.lower():
-                    continue
-
-                if "(" in code or " " in code:
-                    continue
-
-                coupon_codes.add(code)
-
-        return list(coupon_codes)
-
-    except Exception as e:
-        logger.error("exception:", e)
-        return []
+    return _collect(scrape_shipthedeal, links)
     
     
 def fetch_coupons_from_couponkiss(links):
-    try:
-        if not links:
-            return []
-
-        coupon_codes = set()
-
-        for url in links:
-            logger.info("URL:", url)
-            html = getZenrowsWithCookiesResponse(url, isProxy=True)
-            if not html:
-                continue
-
-            soup = BeautifulSoup(html, "html.parser")
-            elements = soup.select("[data-clipboard-text]")
-
-            for el in elements:
-                code = el.get("data-clipboard-text", "").strip()
-
-                if not code:
-                    continue
-
-               
-                if "no code" in code.lower():
-                    continue
-
-                
-                if "(" in code:
-                    continue
-
-                coupon_codes.add(code)
-
-        return list(coupon_codes)
-
-    except Exception as e:
-        logger.error("exception:", e)
-        return []
+    return _collect(scrape_couponskiss, links)
     
     
 def fetch_coupons_from__couponterra(links):
-    try:
-        if not links:
-            return []
-
-        coupon_codes = []
-
-        for url in links:
-            logger.info("URL:", url)
-
-            html = getZenrowsWithCookiesResponse(url, isProxy=True)
-            if not html:
-                continue
-
-            soup = BeautifulSoup(html, "html.parser")
-            elements = soup.select("[data-code]")
-
-            for el in elements:
-                code = el.get("data-code")
-                if code:
-                    coupon_codes.append(code.strip())
-
-        return list(set(coupon_codes))
-
-    except Exception as e:
-        logger.error("exception:", e)
-        return []
+    return _collect(scrape_couponterra, links)
     
 def fetch_coupons_from_rediscount(links):
-    """
-    Extract coupon codes only from GET CODE buttons (ignore CLICK DEAL)
-    """
-    try:
-        if not links:
-            return []
-
-        coupon_codes = []
-
-        for url in links:
-            logger.info("URL:", url)
-
-            html = getZenrowsWithCookiesResponse(url)
-            if not html:
-                continue
-
-            soup = BeautifulSoup(html, "html.parser")
-            buttons = soup.select(".coupons_buttons a.coupon_btn")
-
-            for btn in buttons:
-                text = btn.get_text(strip=True).upper()
-
-                if text != "GET CODE":
-                    continue
-
-                code = btn.get("data-code")
-                if code:
-                    coupon_codes.append(code.strip().upper())
-
-        return coupon_codes
-
-    except Exception as e:
-        logger.error("Error:", e)
-        return []
+    return _collect(scrape_reediscount, links)
     
 def fetch_coupons_from_getscoupon(links):
-    """
-    Extract coupon codes from getlistr divs (data-code attribute)
-    """
-    try:
-        if not links:
-            return []
-
-        coupon_codes = []
-
-        for url in links:
-            logger.info("URL:", url)
-
-            html = getZenrowsWithCookiesResponse(url)
-            logger.info("the html is", html)
-            if not html:
-                continue
-
-            soup = BeautifulSoup(html, "html.parser")
-            divs = soup.find_all("div", class_="getlistr")
-
-            for div in divs:
-                code = div.get("data-code")
-                if code:
-                    coupon_codes.append(code.strip().upper())
-
-        return coupon_codes
-
-    except Exception as e:
-        logger.error("Error:", e)
-        return []
+    return _collect(scrape_getscoupon, links)
     
     
 def fetch_coupons_from_couponsgo(links):
-    try:
-        if not links:
-            return []
-
-        coupon_codes = set()
-        cids = set()
-
-        for url in links:
-            logger.info("Store URL:", url)
-
-            html = getZenrowsWithCookiesResponse(url, isProxy=True)
-            if not html:
-                continue
-
-            soup = BeautifulSoup(html, "html.parser")
-
-            divs = soup.select("div.coupon-item.c-r-item.couponsgoorg")
-            for div in divs:
-                cid = div.get("data-value", "").strip()
-                if cid:
-                    cids.add(cid)
-        for cid in cids:
-            search_url = (
-                f"https://www.couponsgo.org/search?"
-                f"query=tommy-john&cid={cid}"
-            )
-
-
-            search_html = getZenrowsResponse(
-                search_url, js_render=True, isProxy=True
-            )
-            if not search_html:
-                continue
-
-            search_soup = BeautifulSoup(search_html, "html.parser")
-
-            code_tags = search_soup.select("p.code-str.couponsgoorg")
-
-            for tag in code_tags:
-                code = tag.get_text(strip=True)
-
-              
-                if not code:
-                    continue
-                if "no code" in code.lower():
-                    continue
-
-                coupon_codes.add(code)
-
-        final_codes = list(coupon_codes)
-        logger.info("Final Coupons:", final_codes)
-        return final_codes
-
-    except Exception as e:
-        logger.error("exception:", e)
-        return []
+    return _collect(scrape_couponsgo, links)
     
     
     
 def fetch_coupons_from_promosreview(links):
-    try:
-        if not links:
-            return []
-
-        coupon_codes = []
-        
-        for url in links:
-            logger.info("URL:", url)
-            html = getZenrowsWithCookiesResponse(url)
-          
-            if not html:
-                continue
-
-            soup = BeautifulSoup(html, "html.parser")
-            elements = soup.select("[data-code]")
-            for el in elements:
-                code = el.get("data-code", "").strip()
-                if code:
-                    coupon_codes.append(code.upper())
-
-        unique = list(set(coupon_codes))
-        return unique
-
-    except Exception as e:
-        logger.error("exception:", e)
-        return []
+    return _collect(scrape_promosreview, links)
     
     
 def fetch_coupons_from_couponupto(links):
-    try:
-        if not links:
-            return []
-
-        coupon_codes = set()
-        session = requests.Session()
-        session.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.5",
-            "Accept-Encoding": "gzip, deflate, br",
-            "Connection": "keep-alive",
-            "Cache-Control": "no-cache",
-        })
-
-        for url in links:
-            logger.info("URL:", url)
-
-            response = session.get(url, timeout=20)
-            if not response.ok:
-                logger.info(f"CouponUpto bad status {response.status_code} for {url}")
-                continue
-
-            html = response.text
-            if not html:
-                continue
-
-            soup = BeautifulSoup(html, "html.parser")
-
-            for a_tag in soup.select("a.a_code"):
-                p_tag = a_tag.select_one("p[id^='code-']")
-                if not p_tag:
-                    continue
-
-                code = p_tag.get_text(strip=True)
-
-                if not code:
-                    continue
-
-                if "show" in code.lower():
-                    continue
-
-                coupon_codes.add(code.upper())
-
-        logger.info(f"Found {len(coupon_codes)} unique coupons from CouponUpto")
-        return list(coupon_codes)
-
-    except Exception as e:
-        logger.error("exception:", e)
-        return []
+    return _collect(scrape_couponupto, links)
     
 def fetch_coupons_from_trustdeals(links):
-    try:
-        if not links:
-            return []
-
-        coupon_codes = set()
-
-        for url in links:
-            html = getZenrowsWithCookiesResponse(url, isProxy=True)
-            if not html:
-                continue
-
-            soup = BeautifulSoup(html, "html.parser")
-
-          
-            code_spans = soup.select("span.code")
-
-            for span in code_spans:
-                code = span.get_text(strip=True)
-
-                if not code:
-                    continue
-
-                # junk filter (optional but safe)
-                if "no code" in code.lower():
-                    continue
-
-                coupon_codes.add(code)
-
-        final_codes = list(coupon_codes)
-        logger.info("Coupons found:", final_codes)
-        return final_codes
-
-    except Exception as e:
-        logger.error("exception:", e)
-        return []
+    return _collect(scrape_trustdeals, links)
     
 def fetch_coupons_from_gocashback(links):
-    """
-    Extract coupon codes (last argument) from SEE CODE buttons
-    """
-    try:
-        if not links:
-            return []
-
-        coupon_codes = []
-
-        for url in links:
-            logger.info("URL:", url)
-
-            html = getZenrowsWithCookiesResponse(url)
-            if not html:
-                continue
-
-            soup = BeautifulSoup(html, "html.parser")
-            buttons = soup.find_all("div", class_="go-to-buy")
-
-            for btn in buttons:
-                onclick = btn.get("onclick")
-                if not onclick:
-                    continue
-
-                # Extract LAST argument (coupon code)
-                match = re.search(
-                    r"goToBuy\(\d+,\d+,'([^']+)'\)",
-                    onclick
-                )
-
-                if match:
-                    code = match.group(1).upper()
-                    coupon_codes.append(code)
-
-        
-        return coupon_codes
-
-    except Exception as e:
-        logger.error("Error:", e)
-        return []
+    return _collect(scrape_gocashback, links)
     
 def fetch_coupons_from_latest_deals(links):
-   
-    coupons = []
-    scraper = cloudscraper.create_scraper()
+    return _collect(scrape_latestdeals, links)
 
-    headers = {
-        "Accept": "application/json",
-        "Referer": "https://www.latestdeals.co.uk/",
-    }
 
-    for link in links:
-        try:
-            if not link:
-                continue
-            
-            path_parts = urlparse(link).path.strip("/").split("/")
-            if len(path_parts) < 2 or path_parts[0] != "retailers":
-                logger.info(f"Invalid LatestDeals URL: {link}")
-                continue
-
-            merchant_domain = path_parts[1]
-
-            # Build API URL
-            api_url = (
-                "https://www.latestdeals.co.uk/api/posts"
-                f"?merchantSlugDomain={merchant_domain}"
-                "&showExpired=true"
-                "&type="
-                "&noExcerpts=true"
-            )
-
-            # Call API via cloudscraper to bypass Cloudflare
-            res = scraper.get(api_url, headers=headers, timeout=20)
-            if not res.ok:
-                logger.info(f"LatestDeals bad status {res.status_code} for {merchant_domain}")
-                continue
-
-            data = res.json()
-            entities = data.get("entities", {})
-
-            # Extract coupon codes (only voucher type items with a code)
-            for item in entities.values():
-                code = item.get("code")
-                if code and isinstance(code, str) and item.get("type") == "voucher":
-                    coupons.append(code.upper())
-
-        except Exception as e:
-            logger.error("LatestDeals error:", e)
-
-    unique_coupons = list(set(coupons))
-    logger.error(f"Found {len(unique_coupons)} unique coupons from LatestDeals")
-    return unique_coupons
+def fetch_coupons_from_redeempromos(links):
+    return _collect(scrape_redeempromos, links)
 
     

@@ -205,7 +205,7 @@ TEST_LINKS = {
         "https://savingheist.com/store/allpowers/",
     ],
     "coupongrouphy": ["https://coupongrouphy.com/dealstore/hooga-health/"],
-    "gocashback": ["https://www.gocashback.com/stores/macys"],
+    "gocashback": ["https://www.gocashback.com/stores/macys", "https://promo.gocashback.com/uk/store/dark-angel-medical"],
     "reediscount": ["https://www.reediscount.com/secretknit/"],
     "couponterra": ["https://www.couponterra.com/coupons/cakesbody.com"],
     "couponskiss": ["https://lspace.couponskiss.com/"],

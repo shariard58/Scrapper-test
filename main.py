@@ -963,16 +963,30 @@ def scrape_coupongrouphy(url):
     return list(dict.fromkeys(unescape(code).strip() for code in codes if code.strip()))
 
 
-def scrape_gocashback(url):
-    """Return the store's codes from a gocashback /stores/{store} page (JS-rendered, so one expensive request)."""
-    # Coupons only appear after JS rendering: <div class="coupon-code"><span class="codetext">Code:</span> ...
-    # <span class="coupon-text">FRIEND</span>
-    response = client.get(url, params={"js_render": "true", "premium_proxy": "true", "wait": "5000"}, timeout=TIMEOUT)
-    if response.status_code != 200:
-        raise RuntimeError(f"status {response.status_code}")
-    soup = BeautifulSoup(response.text, "html.parser")
-    codes = [element.get_text(strip=True) for element in soup.select(".coupon-code .coupon-text")]
+def _gocashback_codes(html):
+    soup = BeautifulSoup(html, "html.parser")
+    # www.gocashback.com/stores/{store}: <div class="coupon-code">... <span class="coupon-text">FRIEND</span>
+    # promo.gocashback.com/{country}/store/{store}: <div class="coupon-item item-code">... <span class="code-box">BOR25</span>
+    elements = soup.select(".coupon-code .coupon-text") + soup.select(".coupon-item .code-box")
+    codes = [element.get_text(strip=True) for element in elements]
     return list(dict.fromkeys(code for code in codes if code and " " not in code))
+
+
+def scrape_gocashback(url):
+    """Return the store's codes from a gocashback store page. The promo.gocashback.com pages have the codes
+    in plain HTML; the www.gocashback.com /stores/ pages only show them after JS rendering."""
+    codes = _gocashback_codes(fetch_html(url))
+    if codes:
+        return codes
+    # The render sometimes returns the page before the coupons load, so render once more when nothing is found
+    for _ in range(2):
+        response = client.get(url, params={"js_render": "true", "premium_proxy": "true", "wait": "5000"}, timeout=TIMEOUT)
+        if response.status_code != 200:
+            raise RuntimeError(f"status {response.status_code}")
+        codes = _gocashback_codes(response.text)
+        if codes:
+            break
+    return codes
 
 
 def scrape_reediscount(url):
@@ -1158,7 +1172,7 @@ if __name__ == "__main__":
     #run(scrape_goodsearch, TEST_LINKS["goodsearch"])
     # run(scrape_couponcause, TEST_LINKS["couponcause"])
     # run(scrape_dazzdeals, TEST_LINKS["dazzdeals"])
-    run(scrape_joincheckmate, TEST_LINKS["joincheckmate"])
+    # run(scrape_joincheckmate, TEST_LINKS["joincheckmate"])
     # run(scrape_couponsgo, TEST_LINKS["couponsgo"])
     #run(scrape_couponpromo, TEST_LINKS["couponpromo"])
     # run(scrape_kotag, TEST_LINKS["kotag"])
@@ -1179,7 +1193,7 @@ if __name__ == "__main__":
     # run(scrape_savings, TEST_LINKS["savings"])
     #run(scrape_savingheist, TEST_LINKS["savingheist"])
     # run(scrape_coupongrouphy, TEST_LINKS["coupongrouphy"])
-    # run(scrape_gocashback, TEST_LINKS["gocashback"])
+    run(scrape_gocashback, TEST_LINKS["gocashback"])
     #run(scrape_reediscount, TEST_LINKS["reediscount"])
     #run(scrape_couponterra, TEST_LINKS["couponterra"])
     # run(scrape_couponskiss, TEST_LINKS["couponskiss"])
