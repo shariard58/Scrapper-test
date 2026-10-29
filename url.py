@@ -9,7 +9,7 @@ from html import unescape
 
 from bs4 import BeautifulSoup
 
-from main import TIMEOUT, client, get_response, rebates_codes
+from main import TIMEOUT, client, fetch_top_coupert, get_response, rebates_codes
 
 G = "\033[92m"
 R = "\033[91m"
@@ -189,7 +189,12 @@ def coupert(handles, storeDomain, query):
     # Unknown stores show the homepage. The store's own codes are in the Next.js data at
     # props.pageProps.storeInfo.coupons = [{"code": "NEWBIKE200OFF", ...}]; codes elsewhere on the page
     # belong to other featured stores.
+    # Some stores have codes only on top.coupert.com/coupons/{name}-promo-code (fuegodance), which shows them in full
+    # as <span class="hiddenCode">WELCOME15OFF</span>; unknown stores there return 404. It blocks many requests at
+    # random, so it is tried after www.
     def hasCodes(html):
+        if 'class="hiddenCode"' in html:
+            return bool(re.search(r'class="hiddenCode"[^>]*>[^<]+<', html))
         match = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.S)
         if not match:
             return False
@@ -198,9 +203,18 @@ def coupert(handles, storeDomain, query):
 
     return checkSite(
         handles, storeDomain, query, "Coupert", "coupert.com",
-        lambda name: f"https://www.coupert.com/shop/{storeDomain}",
+        lambda name: [
+            f"https://www.coupert.com/shop/{storeDomain}",
+            f"https://top.coupert.com/coupons/{name.replace('-', '')}-promo-code",
+        ],
         hasCodes,
+        fetch=coupertFetch,
     )
+
+
+def coupertFetch(url):
+    """top.coupert.com gets the same extra retries as the code scraper; www.coupert.com uses get_response."""
+    return fetch_top_coupert(url) if "top.coupert.com" in url else get_response(url)
 
 
 def rakuten(handles, storeDomain, query):
@@ -998,8 +1012,8 @@ if __name__ == "__main__":
     # storeDomain = "cleanairkits.com"
     # storeQuery = {"handle": "cleanairkits", "query": ["cleanairkits", "clean-airkits"]}
 
-    storeDomain = "byltbasics.com"
-    storeQuery = {"handle": "byltbasics", "query": ["byltbasics", "Bylt Basics"]}
+    storeDomain = "fuegodance.com"
+    storeQuery = {"handle": "fuegodance", "query": ["fuegodance", "fuego-dance", "Fuego Dance Shoes"]}
 
     # storeDomain = "nobullproject.com"
     # storeQuery = {"handle": "nobull", "query": ["NOBULL", "NOBULL Project"]}
@@ -1009,68 +1023,68 @@ if __name__ == "__main__":
 
     # Comment out a site here to skip it
     SITES = [
-        # coupert,
-        # discounttime,
-        # karmanow,
-        # rakuten,
-        # hotdeals,
-        # slickdeals,
-        # capitalone,
-        # retailmenot,
-        # honey,
-        # rebates,
-        # rebatesme,
-        # coupons,
-        # dealcatcher,
-        # dontpayfull,
+        coupert,
+        discounttime,
+        karmanow,
+        rakuten,
+        hotdeals,
+        slickdeals,
+        capitalone,
+        retailmenot,
+        honey,
+        rebates,
+        rebatesme,
+        coupons,
+        dealcatcher,
+        dontpayfull,
         offers,
         savings,
-        # dealspotr,
-        # promocodes,
-        # couponchief,
-        # goodshop,
-        # simplycodes,
-        # tenereteam,
-        # couponcause,
-        # goodsearch,
-        # valuecom,
-        # lovecoupons,
-        # knoji,
-        # swagbucks,
-        # joinsmarty,
-        # refermate,
-        # discountreactor,
-        # couponbox,
-        # dealdrop,
-        # dazzdeals,
-        # greenpromocode,
-        # couponbind,
-        # deala,
-        # promopro,
-        # troupon,
-        # worthepenny,
-        # savingheist,
-        # coupongrouphy,
-        # joincheckmate,
-        # faircoupons,
-        # gocashback,
-        # trustdeals,
-        # couponupto,
-        # promosreview,
-        # couponsgo,
-        # getscoupon,
-        # rediscount,
-        # couponterra,
-        # couponkiss,
-        # shipthedeal,
-        # couponpromo,
-        # couponblender,
-        # xyzcodes,
-        # kotag,
-        # zensaving,
-        # coponcodes,
-        # dealam,
-        # latestdeals,
+        dealspotr,
+        promocodes,
+        couponchief,
+        goodshop,
+        simplycodes,
+        tenereteam,
+        couponcause,
+        goodsearch,
+        valuecom,
+        lovecoupons,
+        knoji,
+        swagbucks,
+        joinsmarty,
+        refermate,
+        discountreactor,
+        couponbox,
+        dealdrop,
+        dazzdeals,
+        greenpromocode,
+        couponbind,
+        deala,
+        promopro,
+        troupon,
+        worthepenny,
+        savingheist,
+        coupongrouphy,
+        joincheckmate,
+        faircoupons,
+        gocashback,
+        trustdeals,
+        couponupto,
+        promosreview,
+        couponsgo,
+        getscoupon,
+        rediscount,
+        couponterra,
+        couponkiss,
+        shipthedeal,
+        couponpromo,
+        couponblender,
+        xyzcodes,
+        kotag,
+        zensaving,
+        coponcodes,
+        dealam,
+        latestdeals,
     ]
 
     start = time.time()

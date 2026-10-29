@@ -7,6 +7,7 @@ from urllib.parse import quote
 import requests
 from bs4 import BeautifulSoup
 
+from app.config.coupon_scraper import fetch_top_coupert
 from app.lib.helpers import (fetch_once, get_rendered, get_response,
                              getZenrowsTwoResponse, plain_retry,
                              postZenrowsResponse, rendered_twice)
@@ -140,17 +141,29 @@ def coupert(handles, storeDomain, query):
     # The store's own codes are in the Next.js data at props.pageProps.storeInfo.coupons;
     # codes elsewhere on the page belong to other featured stores.
     # Old /store/{domain} links already saved in the DB still work with fetch_coupons_from_coupert.
+    # Some stores have codes only on top.coupert.com/coupons/{name}-promo-code (fuegodance), which shows them in full
+    # as <span class="hiddenCode">WELCOME15OFF</span>; unknown stores there return 404. It blocks many requests at
+    # random, so it is tried after www and gets extra retries.
     def has_codes(html):
+        if 'class="hiddenCode"' in html:
+            return bool(re.search(r'class="hiddenCode"[^>]*>[^<]+<', html))
         match = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.S)
         if not match:
             return False
         store = json.loads(match.group(1)).get("props", {}).get("pageProps", {}).get("storeInfo") or {}
         return any(coupon.get("code") for coupon in store.get("coupons") or [])
 
+    def fetch(url):
+        return fetch_top_coupert(url) if "top.coupert.com" in url else get_response(url)
+
     return check_site(
         handles, storeDomain, query, "Coupert", "coupert",
-        lambda name: f"https://www.coupert.com/shop/{storeDomain}",
+        lambda name: [
+            f"https://www.coupert.com/shop/{storeDomain}",
+            f"https://top.coupert.com/coupons/{name.replace('-', '')}-promo-code",
+        ],
         has_codes,
+        fetch=fetch,
     )
 
 

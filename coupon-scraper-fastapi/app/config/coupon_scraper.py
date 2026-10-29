@@ -148,8 +148,35 @@ def scrape_hotdeals(url):
     return list(dict.fromkeys(active + expired))
 
 
+def fetch_top_coupert(url, tries=10, pause=3):
+    """Return (html, status) for a top.coupert.com page. The site blocks (422) most requests at random,
+    plain and JS-rendered alike, so it gets more tries, switching between the two."""
+    response = None
+    for attempt in range(tries):
+        params = {"js_render": "true", "premium_proxy": "true"} if attempt % 2 else {}
+        try:
+            response = client.get(url, params=params, timeout=TIMEOUT)
+        except requests.RequestException as e:
+            logger.warning(f"Retry ({type(e).__name__}) {url}")
+            continue
+        if response.status_code != 422:
+            return response.text, response.status_code
+        if attempt < tries - 1:
+            time.sleep(pause)
+    if response is None:
+        raise RuntimeError("request failed")
+    return response.text, response.status_code
+
+
 def scrape_coupert(url):
-    """Return the store's codes from a coupert /shop/{domain} page, from one request."""
+    """Return the store's codes from a coupert /shop/{domain} or top.coupert.com /coupons/{name}-promo-code page."""
+    if "top.coupert.com" in url:
+        html, status = fetch_top_coupert(url)
+        if status != 200:
+            raise RuntimeError(f"status {status}")
+        # Every card holds its code in full: <span class="hiddenCode">WELCOME15OFF</span>
+        codes = re.findall(r'class="hiddenCode"[^>]*>([^<]+)<', html)
+        return list(dict.fromkeys(unescape(code).strip() for code in codes if code.strip()))
     html = fetch_html(url)
     # The store's own codes are in the Next.js data at props.pageProps.storeInfo.coupons;
     # codes elsewhere on the page belong to other featured stores. Coupert lists no expired codes.
