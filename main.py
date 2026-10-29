@@ -57,6 +57,29 @@ def fetch_html(url):
     return html
 
 
+def reveal_all(reveal, items, workers=5, pause=3):
+    """Run reveal(*item) for every item in parallel and return the codes found, in item order.
+    A reveal that raises (blocked or network error) gets one more try after a short pause;
+    a reveal that returns None found no code and is not retried."""
+    def attempt(item):
+        try:
+            return reveal(*item), False
+        except Exception:
+            return None, True
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        results = list(pool.map(attempt, items))
+        failed = [i for i, (_, blocked) in enumerate(results) if blocked]
+        if failed:
+            time.sleep(pause)
+            for i, result in zip(failed, pool.map(attempt, [items[i] for i in failed])):
+                results[i] = result
+    still_failed = sum(blocked for _, blocked in results)
+    if still_failed:
+        print(f"{still_failed} of {len(items)} reveals failed twice")
+    return list(dict.fromkeys(code for code, _ in results if code))
+
+
 def scrape_refermate(url):
     html = fetch_html(url)
     # Codes live as "couponCode" inside the hidden Next.js payload (self.__next_f.push)
@@ -274,8 +297,15 @@ def fetch_plain_retry(url, tries=8, pause=3):
 
 def scrape_valuecom(url):
     """Return the store's codes from a valuecom {store}.valuecom.com page."""
-    # valuecom blocks most requests (422) at random, so it gets plain retries instead of get_response
-    html = fetch_plain_retry(url)
+    # valuecom blocks most requests (422) at random, so it gets plain retries instead of get_response;
+    # blocks come in streaks, so after a fully blocked round it waits a bit and tries one more round
+    try:
+        html = fetch_plain_retry(url)
+    except RuntimeError as e:
+        if not str(e).startswith("blocked"):
+            raise
+        time.sleep(10)
+        html = fetch_plain_retry(url)
     # The store's offers are JSON-LD: {"@type":"Offer",...,"couponCode":"SA50-tuoiVn",...}.
     # The "Similar Store Coupons" section shows other stores' codes in the HTML, but not in the JSON-LD.
     codes = re.findall(r'"couponCode":"([^"]+)"', html)
@@ -628,10 +658,10 @@ def scrape_kotag(url):
 
 
 def retailmenot_reveal(uuid):
-    """Return the full code from retailmenot's post-click modal for one offer, or None."""
+    """Return the full code from retailmenot's post-click modal for one offer, or None. Raises when blocked."""
     body, status = get_response(f"https://www.retailmenot.com/modals/outclick/{uuid}/?template=merchant&trigger=entrance_modal")
     if status != 200:
-        return None
+        raise RuntimeError(f"status {status}")
     try:
         modal = json.loads(body).get("modalHtml") or ""
     except ValueError:
@@ -658,16 +688,16 @@ def scrape_retailmenot(url):
     uuids = list(dict.fromkeys(uuid for slug, uuid in offers if slug == store))
     expired = set(re.findall(r"module=expired_offer[^\"]*offer_uuid=([A-Z0-9]+)", html))
     uuids = [u for u in uuids if u not in expired] + [u for u in uuids if u in expired]
-    with ThreadPoolExecutor(max_workers=5) as pool:
-        codes = list(pool.map(retailmenot_reveal, uuids))
-    return list(dict.fromkeys(code for code in codes if code))
+    return reveal_all(retailmenot_reveal, [(uuid,) for uuid in uuids])
 
 
 def offers_reveal(page, uuid):
-    """Return the full code from offers.com's code modal (?em=<uuid>), or None."""
+    """Return the full code from offers.com's code modal (?em=<uuid>), or None. Raises when blocked."""
     html, status = get_response(f"{page}?em={uuid}")
+    if status != 200:
+        raise RuntimeError(f"status {status}")
     # The modal renders as x-data="{ copiedButtonClicked: false, code: 'first25' }"
-    code = re.search(r"copiedButtonClicked: false, code: '([^']+)'", unescape(html)) if status == 200 else None
+    code = re.search(r"copiedButtonClicked: false, code: '([^']+)'", unescape(html))
     # Some offers hold a note instead of a code ("Code Provided with Signup"); real codes have no spaces
     return code.group(1).strip() if code and " " not in code.group(1).strip() else None
 
@@ -682,9 +712,7 @@ def scrape_offers(url):
     # (offers.com shares offer ids and codes with RetailMeNot.)
     uuids = re.findall(r"commerceLink\('([A-Z0-9]+)'[^>]*hasCode: true", html)
     uuids = list(dict.fromkeys(uuids))
-    with ThreadPoolExecutor(max_workers=5) as pool:
-        codes = list(pool.map(lambda uuid: offers_reveal(page, uuid), uuids))
-    return list(dict.fromkeys(code for code in codes if code))
+    return reveal_all(offers_reveal, [(page, uuid) for uuid in uuids])
 
 
 def scrape_trustdeals(url):
@@ -858,9 +886,13 @@ def scrape_couponbox(url):
 
 
 def promopro_reveal(coupon_id, tail):
-    """Return the full code from promopro's coupon detail page, or None."""
-    html, status = get_response(f"https://www.promopro.com/coupon-codes/detail/{coupon_id}.html")
-    code = re.search(r'<div id="codeText">([^<]+)</div>', html) if status == 200 else None
+    """Return the full code from promopro's coupon detail page, or None. Raises when blocked."""
+    # Plain requests to detail pages are always blocked (422) while JS rendering gets through, so go straight to it
+    response = client.get(f"https://www.promopro.com/coupon-codes/detail/{coupon_id}.html",
+                          params={"js_render": "true", "premium_proxy": "true"}, timeout=TIMEOUT)
+    if response.status_code != 200:
+        raise RuntimeError(f"status {response.status_code}")
+    code = re.search(r'<div id="codeText">([^<]+)</div>', response.text)
     if not code:
         return None
     code = unescape(code.group(1)).strip()
@@ -883,10 +915,7 @@ def scrape_promopro(url):
         if coupon_id and tail and tail.group(1).strip() and " " not in tail.group(1).strip():
             offers.append((coupon_id.group(1), tail.group(1).strip()))
     offers = list(dict.fromkeys(offers))
-    # Detail pages get blocked when many are requested at once, so fewer run in parallel than on other sites
-    with ThreadPoolExecutor(max_workers=3) as pool:
-        codes = list(pool.map(lambda offer: promopro_reveal(*offer), offers))
-    return list(dict.fromkeys(code for code in codes if code))
+    return reveal_all(promopro_reveal, offers)
 
 
 def scrape_rebatesme(url):
@@ -1158,7 +1187,7 @@ if __name__ == "__main__":
     # run(scrape_tenereteam, TEST_LINKS["tenereteam"])
     # run(scrape_valuecom, TEST_LINKS["valuecom"])
     #run(scrape_refermate, TEST_LINKS["refermate"])
-    # run(scrape_discountreactor, TEST_LINKS["discountreactor"])
+    run(scrape_discountreactor, TEST_LINKS["discountreactor"])
     # run(scrape_dealdrop, TEST_LINKS["dealdrop"])
     # run(scrape_greenpromocode, TEST_LINKS["greenpromocode"])
     #run(scrape_couponbind, TEST_LINKS["couponbind"])
@@ -1193,7 +1222,7 @@ if __name__ == "__main__":
     # run(scrape_savings, TEST_LINKS["savings"])
     #run(scrape_savingheist, TEST_LINKS["savingheist"])
     # run(scrape_coupongrouphy, TEST_LINKS["coupongrouphy"])
-    run(scrape_gocashback, TEST_LINKS["gocashback"])
+    # run(scrape_gocashback, TEST_LINKS["gocashback"])
     #run(scrape_reediscount, TEST_LINKS["reediscount"])
     #run(scrape_couponterra, TEST_LINKS["couponterra"])
     # run(scrape_couponskiss, TEST_LINKS["couponskiss"])

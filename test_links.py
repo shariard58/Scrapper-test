@@ -53,8 +53,8 @@ TEST_LINKS = {
     ],
     "discountreactor": [
         "https://www.discountreactor.com/coupons/cozyearth.com",
-        "https://www.discountreactor.com/coupons/nobullproject.com",
-        "https://www.discountreactor.com/coupons/tommyjohn.com",
+        # "https://www.discountreactor.com/coupons/nobullproject.com",
+        # "https://www.discountreactor.com/coupons/tommyjohn.com",
     ],
     "dealdrop": [
         "https://www.dealdrop.com/cozy-earth",
@@ -137,12 +137,13 @@ TEST_LINKS = {
         # "https://www.retailmenot.com/view/nobullproject.com",
         # "https://www.retailmenot.com/view/tommyjohn.com",
         # "https://www.retailmenot.com/view/ubeauty.com",
-        "https://www.retailmenot.com/view/softminkyblankets.com"
+        # "https://www.retailmenot.com/view/softminkyblankets.com",
+        "https://www.retailmenot.com/view/bestbuy.com",
     ],
     "offers": [
-        "https://www.offers.com/stores/nobull/",
-        "https://www.offers.com/stores/tommy-john/",
-        "https://www.offers.com/stores/macys-us/",
+        "https://www.offers.com/stores/home-chef/",
+        # "https://www.offers.com/stores/tommy-john/",
+        # "https://www.offers.com/stores/macys-us/",
     ],
     "trustdeals": [
         "https://www.trustdeals.com/view/nobullproject.com",
@@ -185,7 +186,7 @@ TEST_LINKS = {
     ],
     "promopro": [
         "https://www.promopro.com/coupon-codes/tommy-john",
-        "https://www.promopro.com/coupon-codes/banila-co",
+        # "https://www.promopro.com/coupon-codes/banila-co",
     ],
     "rebates": [
         "https://rebates.com/coupons/tommyjohn.com",
