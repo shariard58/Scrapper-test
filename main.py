@@ -1135,12 +1135,12 @@ if __name__ == "__main__":
 
     # Run one site at a time; comment out the others
     # run(scrape_hotdeals, TEST_LINKS["hotdeals"])
-    #run(scrape_coupert, TEST_LINKS["coupert"])
+    # run(scrape_coupert, TEST_LINKS["coupert"])
     # run(scrape_joinhoney, TEST_LINKS["joinhoney"])
     #run(scrape_dontpayfull, TEST_LINKS["dontpayfull"])
     # run(scrape_promocodes, TEST_LINKS["promocodes"])
     # run(scrape_couponchief, TEST_LINKS["couponchief"])
-    run(scrape_simplycodes, TEST_LINKS["simplycodes"])
+    # run(scrape_simplycodes, TEST_LINKS["simplycodes"])
     # run(scrape_tenereteam, TEST_LINKS["tenereteam"])
     # run(scrape_valuecom, TEST_LINKS["valuecom"])
     #run(scrape_refermate, TEST_LINKS["refermate"])
@@ -1158,7 +1158,7 @@ if __name__ == "__main__":
     #run(scrape_goodsearch, TEST_LINKS["goodsearch"])
     # run(scrape_couponcause, TEST_LINKS["couponcause"])
     # run(scrape_dazzdeals, TEST_LINKS["dazzdeals"])
-    # run(scrape_joincheckmate, TEST_LINKS["joincheckmate"])
+    run(scrape_joincheckmate, TEST_LINKS["joincheckmate"])
     # run(scrape_couponsgo, TEST_LINKS["couponsgo"])
     #run(scrape_couponpromo, TEST_LINKS["couponpromo"])
     # run(scrape_kotag, TEST_LINKS["kotag"])

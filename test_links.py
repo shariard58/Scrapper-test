@@ -33,7 +33,7 @@ TEST_LINKS = {
         # "https://simplycodes.com/store/cozyearth.com",
         # "https://simplycodes.com/store/nobullproject.com",
         # "https://simplycodes.com/store/tommyjohn.com",
-        "https://simplycodes.com/store/softminkyblankets.com"
+        "https://simplycodes.com/store/cleanairkits.com"
     ],
     "tenereteam": [
         "https://cozy-earth.tenereteam.com/coupons",
@@ -117,7 +117,7 @@ TEST_LINKS = {
     "joincheckmate": [
         # "https://joincheckmate.com/merchants/cozyearth.com",
         # "https://joincheckmate.com/merchants/tommyjohn.com",
-        "https://joincheckmate.com/merchants/softminkyblankets.com"
+        "https://joincheckmate.com/merchants/cleanairkits.com"
     ],
     "couponsgo": [
         # "https://www.couponsgo.org/search?query=cozy+earth",
@@ -173,7 +173,7 @@ TEST_LINKS = {
     "coupert": [
         # "https://www.coupert.com/shop/tommyjohn.com",
         # "https://www.coupert.com/shop/samsung.com",
-        "https://www.coupert.com/shop/softminkyblankets.com"
+        "https://www.coupert.com/shop/cleanairkits.com"
     ],
     "lovecoupons": [
         "https://www.lovecoupons.com/tommy-john",
